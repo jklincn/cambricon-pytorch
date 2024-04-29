@@ -1,0 +1,14 @@
+diff --git a/torch/_tensor_str.py b/torch/_tensor_str.py
+index 986be67a52..a2ac5e5e04 100644
+--- a/torch/_tensor_str.py
++++ b/torch/_tensor_str.py
+@@ -398,6 +398,9 @@ def _str_intern(inp, *, tensor_contents=None):
+             self.device.type == "cuda"
+             and torch.cuda.current_device() != self.device.index
+         )
++        or (self.device.type == 'mlu'
++            and torch.mlu.current_device() != self.device.index
++        )
+         or (self.device.type == "mps")
+     ):
+         suffixes.append("device='" + str(self.device) + "'")

@@ -1,0 +1,53 @@
+diff --git a/c10/core/impl/DeviceGuardImplInterface.h b/c10/core/impl/DeviceGuardImplInterface.h
+index 5a409715a6..ece318b570 100644
+--- a/c10/core/impl/DeviceGuardImplInterface.h
++++ b/c10/core/impl/DeviceGuardImplInterface.h
+@@ -38,6 +38,9 @@ enum class EventFlag {
+   // HIP flags
+   HIP_EVENT_DEFAULT,
+   HIP_EVENT_DISABLE_TIMING, // PyTorch-default for HIP
++  // MLU flags
++  MLU_EVENT_DEFAULT,
++  MLU_EVENT_DISABLE_TIMING,
+   // FOR TESTING ONLY
+   INVALID
+ };
+diff --git a/torch/nn/modules/batchnorm.py b/torch/nn/modules/batchnorm.py
+index 382accfef5..3a4e687dc6 100644
+--- a/torch/nn/modules/batchnorm.py
++++ b/torch/nn/modules/batchnorm.py
+@@ -681,9 +681,9 @@ class SyncBatchNorm(_BatchNorm):
+             )
+ 
+     def forward(self, input: Tensor) -> Tensor:
+-        # currently only GPU input is supported
+-        if not input.is_cuda:
+-            raise ValueError("SyncBatchNorm expected input tensor to be on GPU")
++        # currently only GPU/MLU input is supported
++        if not input.is_cuda and not input.is_mlu:
++            raise ValueError("SyncBatchNorm expected input tensor to be on GPU/MLU")
+ 
+         self._check_input_dim(input)
+         self._check_non_zero_input_channels(input)
+diff --git a/torch/nn/modules/_functions.py b/torch/nn/modules/_functions.py
+index 66200345cb..06adc48953 100644
+--- a/torch/nn/modules/_functions.py
++++ b/torch/nn/modules/_functions.py
+@@ -46,7 +46,7 @@ class SyncBatchNorm(Function):
+         # batch_norm_gather_stats_with_counts calculates global mean & invstd based on
+         # all gathered mean, invstd and count.
+         # for nccl backend, use the optimized version of all gather.
+-        if process_group._get_backend_name() == 'nccl':
++        if (process_group._get_backend_name() == 'nccl') or (process_group._get_backend_name() == 'cncl'):
+             # world_size * (2C + 1)
+             combined_size = combined.numel()
+             combined_flat = torch.empty(1,
+@@ -67,7 +67,7 @@ class SyncBatchNorm(Function):
+             # world_size * (2C + 1) -> world_size * C, world_size * C, world_size * 1
+             mean_all, invstd_all, count_all = torch.split(combined, num_channels, dim=1)
+ 
+-        if not torch.cuda.is_current_stream_capturing():
++        if not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()):
+             # The lines below force a synchronization between CUDA and CPU, because
+             # the shape of the result count_all depends on the values in mask tensor.
+             # Such synchronizations break CUDA Graph capturing.

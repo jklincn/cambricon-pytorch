@@ -1,0 +1,13 @@
+diff --git a/aten/src/ATen/native/ConvUtils.h b/aten/src/ATen/native/ConvUtils.h
+index a31dbee2bd..b4ad8781ba 100644
+--- a/aten/src/ATen/native/ConvUtils.h
++++ b/aten/src/ATen/native/ConvUtils.h
+@@ -81,7 +81,7 @@ static inline bool cudnnv8_use_heur_mode_b() {
+ }
+ 
+ // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+-struct ConvParams {
++struct TORCH_API ConvParams {
+   std::vector<int64_t> stride;
+   std::vector<int64_t> padding;
+   std::vector<int64_t> dilation;

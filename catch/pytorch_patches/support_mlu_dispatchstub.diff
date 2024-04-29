@@ -1,0 +1,44 @@
+diff --git a/aten/src/ATen/native/DispatchStub.cpp b/aten/src/ATen/native/DispatchStub.cpp
+index a91448c3..22932809 100644
+--- a/aten/src/ATen/native/DispatchStub.cpp
++++ b/aten/src/ATen/native/DispatchStub.cpp
+@@ -122,6 +122,10 @@ void* DispatchStubImpl::get_call_ptr(
+       TORCH_INTERNAL_ASSERT(hip_dispatch_ptr, "DispatchStub: missing HIP kernel");
+       return hip_dispatch_ptr;
+ 
++    case DeviceType::MLU:
++      TORCH_INTERNAL_ASSERT(mlu_dispatch_ptr, "DispatchStub: missing MLU kernel");
++      return mlu_dispatch_ptr;
++
+ #if defined(USE_MPS)
+     case DeviceType::MPS:
+       TORCH_INTERNAL_ASSERT(mps_dispatch_ptr, "DispatchStub: missing MPS kernel");
+diff --git a/aten/src/ATen/native/DispatchStub.h b/aten/src/ATen/native/DispatchStub.h
+index bcbf41fd..95b6cbf4 100644
+--- a/aten/src/ATen/native/DispatchStub.h
++++ b/aten/src/ATen/native/DispatchStub.h
+@@ -112,11 +112,13 @@ struct TORCH_API DispatchStubImpl {
+   // See https://github.com/pytorch/pytorch/issues/22681 for more details.
+   #if defined(_MSC_VER) && defined(_DEBUG)
+     std::atomic<void*> cpu_dispatch_ptr;
++    void* mlu_dispatch_ptr;
+     void* cuda_dispatch_ptr;
+     void* hip_dispatch_ptr;
+     void* mps_dispatch_ptr;
+   #else
+     std::atomic<void*> cpu_dispatch_ptr{nullptr};
++    void* mlu_dispatch_ptr = nullptr;
+     void* cuda_dispatch_ptr = nullptr;
+     void* hip_dispatch_ptr = nullptr;
+     void* mps_dispatch_ptr = nullptr;
+@@ -159,6 +161,10 @@ public:
+     return (*call_ptr)(std::forward<ArgTypes>(args)...);
+   }
+ 
++  void set_mlu_dispatch_ptr(FnPtr fn_ptr) {
++    impl.mlu_dispatch_ptr = reinterpret_cast<void*>(fn_ptr);
++  }
++
+   void set_cuda_dispatch_ptr(FnPtr fn_ptr) {
+     impl.cuda_dispatch_ptr = reinterpret_cast<void*>(fn_ptr);
+   }

@@ -1,0 +1,117 @@
+diff --git a/torch/random.py b/torch/random.py
+index f5156bf487..e11a15eb81 100644
+--- a/torch/random.py
++++ b/torch/random.py
+@@ -39,6 +39,14 @@ def manual_seed(seed) -> torch._C.Generator:
+     if not torch.cuda._is_in_bad_fork():
+         torch.cuda.manual_seed_all(seed)
+ 
++    try:
++        import torch_mlu
++    except:
++        warnings.warn("To use MLU backend, please install torch_mlu")
++    else:
++        if not torch.mlu._is_in_bad_fork():
++            torch.mlu.manual_seed_all(seed)
++
+     return default_generator.manual_seed(seed)
+ 
+ 
+@@ -52,6 +60,14 @@ def seed() -> int:
+     if not torch.cuda._is_in_bad_fork():
+         torch.cuda.manual_seed_all(seed)
+ 
++    try:
++        import torch_mlu
++    except:
++        warnings.warn("To use MLU backend, please install torch_mlu")
++    else:
++        if not torch.mlu._is_in_bad_fork():
++            torch.mlu.manual_seed_all(seed)
++
+     return seed
+ 
+ 
+@@ -94,18 +110,18 @@ def fork_rng(devices=None, enabled=True, _caller="fork_rng", _devices_kw="device
+         return
+ 
+     if devices is None:
+-        num_devices = torch.cuda.device_count()
++        num_devices = torch.mlu.device_count() if torch.is_mlu_available() else  torch.cuda.device_count()
+         if num_devices > 1 and not _fork_rng_warned_already:
+             warnings.warn(
+-                ("CUDA reports that you have {num_devices} available devices, and you "
++                ("CUDA or MLU reports that you have {num_devices} available devices, and you "
+                  "have used {caller} without explicitly specifying which devices are being used. "
+-                 "For safety, we initialize *every* CUDA device by default, which "
+-                 "can be quite slow if you have a lot of GPUs.  If you know that you are only "
+-                 "making use of a few CUDA devices, set the environment variable CUDA_VISIBLE_DEVICES "
++                 "For safety, we initialize *every* CUDA or MLU device by default, which "
++                 "can be quite slow if you have a lot of GPUs or MLUs.  If you know that you are only "
++                 "making use of a few CUDA or MLU devices, set the environment variable CUDA_VISIBLE_DEVICES or MLU_VISIBLE_DEVICES"
+                  "or the '{devices_kw}' keyword argument of {caller} with the set of devices "
+                  "you are actually using.  For example, if you are using CPU only, "
+-                 "set CUDA_VISIBLE_DEVICES= or devices=[]; if you are using "
+-                 "GPU 0 only, set CUDA_VISIBLE_DEVICES=0 or devices=[0].  To initialize "
++                 "set CUDA_VISIBLE_DEVICES= or MLU_VISIBLE_DEVICES= or devices=[]; if you are using "
++                 "GPU or MLU 0 only, set CUDA_VISIBLE_DEVICES=0 or MLU_VISIBLE_DEVICES=0 or devices=[0].  To initialize "
+                  "all devices and suppress this warning, set the '{devices_kw}' keyword argument "
+                  "to `range(torch.cuda.device_count())`."
+                  ).format(num_devices=num_devices, caller=_caller, devices_kw=_devices_kw))
+@@ -118,12 +134,20 @@ def fork_rng(devices=None, enabled=True, _caller="fork_rng", _devices_kw="device
+ 
+     cpu_rng_state = torch.get_rng_state()
+     gpu_rng_states = []
++    mlu_rng_states = []
+     for device in devices:
+-        gpu_rng_states.append(torch.cuda.get_rng_state(device))
++        if torch.is_mlu_available():
++            mlu_rng_states.append(torch.mlu.get_rng_state(device))
++        else:
++            gpu_rng_states.append(torch.cuda.get_rng_state(device))
+ 
+     try:
+         yield
+     finally:
+         torch.set_rng_state(cpu_rng_state)
+-        for device, gpu_rng_state in zip(devices, gpu_rng_states):
+-            torch.cuda.set_rng_state(gpu_rng_state, device)
++        if torch.is_mlu_available():
++            for device, mlu_rng_state in zip(devices, mlu_rng_states):
++                torch.mlu.set_rng_state(mlu_rng_state, device)
++        else:
++            for device, gpu_rng_state in zip(devices, gpu_rng_states):
++                torch.cuda.set_rng_state(gpu_rng_state, device)
+
+diff --git a/torch/csrc/Generator.h b/torch/csrc/Generator.h
+index f5b7b4661e..58ab32b3a7 100644
+--- a/torch/csrc/Generator.h
++++ b/torch/csrc/Generator.h
+@@ -15,10 +15,12 @@ struct THPGenerator {
+ TORCH_PYTHON_API PyObject* THPGenerator_initDefaultGenerator(
+     at::Generator cdata);
+
+-#define THPGenerator_Check(obj) PyObject_IsInstance(obj, THPGeneratorClass)
++#define THPGenerator_Check(obj) PyObject_IsInstance(obj, THPGeneratorClass) or PyObject_IsInstance(obj, THCGeneratorClass)
+
+ TORCH_PYTHON_API extern PyObject* THPGeneratorClass;
+
++TORCH_PYTHON_API extern PyObject* THCGeneratorClass;
++
+ bool THPGenerator_init(PyObject* module);
+
+ TORCH_PYTHON_API PyObject* THPGenerator_Wrap(at::Generator gen);
+
+diff --git a/torch/csrc/Generator.cpp b/torch/csrc/Generator.cpp
+index 31dcfefaea..d3ac0011d1 100644
+--- a/torch/csrc/Generator.cpp
++++ b/torch/csrc/Generator.cpp
+@@ -22,6 +22,8 @@ using namespace torch;
+
+ PyObject* THPGeneratorClass = nullptr;
+
++PyObject* THCGeneratorClass = nullptr;
++
+ PyObject* THPGenerator_initDefaultGenerator(at::Generator cdata) {
+   auto type = (PyTypeObject*)THPGeneratorClass;
+   auto self = THPObjectPtr{type->tp_alloc(type, 0)};

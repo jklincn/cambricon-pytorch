@@ -1,0 +1,148 @@
+diff --git a/torch/utils/checkpoint.py b/torch/utils/checkpoint.py
+index d28cf4a1c3..fa994ce26f 100644
+--- a/torch/utils/checkpoint.py
++++ b/torch/utils/checkpoint.py
+@@ -41,6 +41,16 @@ def check_backward_validity(inputs: Iterable[Any]) -> None:
+ def get_device_states(*args) -> Tuple[List[int], List[torch.Tensor]]:
+     # This will not error out if "arg" is a CPU tensor or a non-tensor type because
+     # the conditionals short-circuit.
++    if torch.is_mlu_available():
++        fwd_mlu_devices = list(set(arg.get_device() for arg in args
++                                   if isinstance(arg, torch.Tensor) and arg.is_mlu))
++        fwd_mlu_states = []
++        for device in fwd_mlu_devices:
++            with torch.mlu.device(device):
++                fwd_mlu_states.append(torch.mlu.get_rng_state())
++
++        return fwd_mlu_devices, fwd_mlu_states
++
+     fwd_gpu_devices = list(set(arg.get_device() for arg in args
+                                if isinstance(arg, torch.Tensor) and arg.is_cuda))
+ 
+@@ -54,8 +64,12 @@ def get_device_states(*args) -> Tuple[List[int], List[torch.Tensor]]:
+ 
+ def set_device_states(devices, states) -> None:
+     for device, state in zip(devices, states):
+-        with torch.cuda.device(device):
+-            torch.cuda.set_rng_state(state)
++        if torch.cuda.is_available():
++            with torch.cuda.device(device):
++                torch.cuda.set_rng_state(state)
++        elif torch.is_mlu_available():
++            with torch.mlu.device(device):
++                torch.mlu.set_rng_state(state)
+ 
+ def _get_autocast_kwargs():
+     gpu_autocast_kwargs = {"enabled": torch.is_autocast_enabled(),
+@@ -66,7 +80,11 @@ def _get_autocast_kwargs():
+                            "dtype": torch.get_autocast_cpu_dtype(),
+                            "cache_enabled": torch.is_autocast_cache_enabled()}
+ 
+-    return gpu_autocast_kwargs, cpu_autocast_kwargs
++    mlu_autocast_kwargs = {"enabled": torch.is_autocast_mlu_enabled(),
++                           "dtype": torch.get_autocast_mlu_dtype(),
++                           "cache_enabled": torch.is_autocast_cache_enabled()}
++
++    return gpu_autocast_kwargs, cpu_autocast_kwargs, mlu_autocast_kwargs
+ 
+ class CheckpointFunction(torch.autograd.Function):
+ 
+@@ -76,7 +94,7 @@ class CheckpointFunction(torch.autograd.Function):
+         ctx.run_function = run_function
+         ctx.preserve_rng_state = preserve_rng_state
+         # Accommodates the (remote) possibility that autocast is enabled for cpu AND gpu.
+-        ctx.gpu_autocast_kwargs, ctx.cpu_autocast_kwargs = _get_autocast_kwargs()
++        ctx.gpu_autocast_kwargs, ctx.cpu_autocast_kwargs, ctx.mlu_autocast_kwargs = _get_autocast_kwargs()
+         if preserve_rng_state:
+             ctx.fwd_cpu_state = torch.get_rng_state()
+             # Don't eagerly initialize the cuda context by accident.
+@@ -88,6 +106,11 @@ class CheckpointFunction(torch.autograd.Function):
+                 ctx.had_cuda_in_fwd = True
+                 ctx.fwd_gpu_devices, ctx.fwd_gpu_states = get_device_states(*args)
+ 
++            ctx.had_mlu_in_fwd = False
++            if torch.is_mlu_available() and torch.mlu.is_initialized():
++                ctx.had_mlu_in_fwd = True
++                ctx.fwd_mlu_devices, ctx.fwd_mlu_states = get_device_states(*args)
++
+         # Save non-tensor inputs in ctx, keep a placeholder None for tensors
+         # to be filled out during the backward.
+         ctx.inputs = []
+@@ -129,15 +152,20 @@ class CheckpointFunction(torch.autograd.Function):
+         rng_devices = []
+         if ctx.preserve_rng_state and ctx.had_cuda_in_fwd:
+             rng_devices = ctx.fwd_gpu_devices
++        if ctx.preserve_rng_state and ctx.had_mlu_in_fwd:
++            rng_devices = ctx.fwd_mlu_devices
+         with torch.random.fork_rng(devices=rng_devices, enabled=ctx.preserve_rng_state):
+             if ctx.preserve_rng_state:
+                 torch.set_rng_state(ctx.fwd_cpu_state)
+                 if ctx.had_cuda_in_fwd:
+                     set_device_states(ctx.fwd_gpu_devices, ctx.fwd_gpu_states)
++                if ctx.had_mlu_in_fwd:
++                    set_device_states(ctx.fwd_mlu_devices, ctx.fwd_mlu_states)
+             detached_inputs = detach_variable(tuple(inputs))
+             with torch.enable_grad(), \
+                  torch.cuda.amp.autocast(**ctx.gpu_autocast_kwargs), \
+-                 torch.cpu.amp.autocast(**ctx.cpu_autocast_kwargs):
++                 torch.cpu.amp.autocast(**ctx.cpu_autocast_kwargs), \
++                 torch.mlu.amp.autocast(**ctx.mlu_autocast_kwargs):
+                 outputs = ctx.run_function(*detached_inputs)
+ 
+         if isinstance(outputs, torch.Tensor):
+@@ -337,8 +365,8 @@ def _checkpoint_without_reentrant(function, preserve_rng_state=True, *args, **kw
+         *args: Arguments to pass in to the given ``function``.
+         **kwargs: Keyword arguments to pass into the given ``function``.
+     """
+-    # Accommodates the (remote) possibility that autocast is enabled for cpu AND gpu.
+-    gpu_autocast_kwargs, cpu_autocast_kwargs = _get_autocast_kwargs()
++    # Accommodates the (remote) possibility that autocast is enabled for cpu, gpu AND mlu.
++    gpu_autocast_kwargs, cpu_autocast_kwargs, mlu_autocast_kwargs = _get_autocast_kwargs()
+ 
+     if preserve_rng_state:
+         fwd_cpu_state = torch.get_rng_state()
+@@ -347,6 +375,10 @@ def _checkpoint_without_reentrant(function, preserve_rng_state=True, *args, **kw
+         # run_function, we SHOULD actually stash the cuda state here.  Unfortunately,
+         # we have no way to anticipate this will happen before we run the function.
+         # If they do so, we raise an error.)
++        had_mlu_in_fwd = False
++        if torch.mlu._initialized:
++            had_mlu_in_fwd = True
++            fwd_mlu_devices, fwd_mlu_states = get_device_states(*args)
+         had_cuda_in_fwd = False
+         if torch.cuda._initialized:
+             had_cuda_in_fwd = True
+@@ -395,15 +427,20 @@ def _checkpoint_without_reentrant(function, preserve_rng_state=True, *args, **kw
+             rng_devices = []
+             if preserve_rng_state and had_cuda_in_fwd:
+                 rng_devices = fwd_gpu_devices
++            elif preserve_rng_state and had_mlu_in_fwd:
++                rng_devices = fwd_mlu_devices
+             with torch.random.fork_rng(devices=rng_devices, enabled=preserve_rng_state):
+                 if preserve_rng_state:
+                     torch.set_rng_state(fwd_cpu_state)
+                     if had_cuda_in_fwd:
+                         set_device_states(fwd_gpu_devices, fwd_gpu_states)
++                    elif had_mlu_in_fwd:
++                        set_device_states(fwd_mlu_devices, fwd_mlu_states)
+ 
+                 with torch.enable_grad(), \
+                      torch.cuda.amp.autocast(**gpu_autocast_kwargs), \
+                      torch.cpu.amp.autocast(**cpu_autocast_kwargs), \
++                     torch.mlu.amp.autocast(**mlu_autocast_kwargs), \
+                      torch.autograd.graph.saved_tensors_hooks(inner_pack, inner_unpack):
+                     _unused = function(*args, **kwargs)
+ 
+@@ -425,5 +462,12 @@ def _checkpoint_without_reentrant(function, preserve_rng_state=True, *args, **kw
+                 "PyTorch's CUDA state was initialized in the forward pass "
+                 "of a Checkpoint, which is not allowed. Please open an issue "
+                 "if you need this feature.")
++        elif torch.mlu._initialized and preserve_rng_state and not had_mlu_in_fwd:
++            # MLU was not initialized before running the forward, so we didn't
++            # stash the MLU state.
++            raise RuntimeError(
++                "PyTorch's MLU state was initialized in the forward pass "
++                "of a Checkpoint, which is not allowed. Please open an issue "
++                "if you need this feature.")
+ 
+     return output

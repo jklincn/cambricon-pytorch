@@ -1,0 +1,9 @@
+pytest
+scipy
+pillow
+pandas
+numpy
+typing
+cpplint
+pylint
+librosa

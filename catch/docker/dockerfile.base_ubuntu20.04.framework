@@ -1,0 +1,122 @@
+ARG py_suffix="py310"
+FROM yellow.hub.cambricon.com/pytorch/base/x86_64/pytorch:v0.4-x86_64-ubuntu20.04-torch_${py_suffix}_gcc7_mpi
+
+#shell
+SHELL ["/bin/bash", "-c"]
+ARG py_suffix="py310"
+# copy whl to docker
+COPY wheel_${py_suffix}  /torch/wheel_${py_suffix}
+
+# git clone code
+ARG catch_branch="catch_1.13.1_develop"
+ARG vision_branch="vision_0.14.1"
+ARG audio_branch="audio_0.13.1"
+ARG pytorch_branch="pytorch_1.13.1"
+ARG pytorch_models_branch="pytorch_models_1.13.1_develop"
+ARG benchmark_version
+
+# neuware lib version
+ARG driver_version
+ARG cntoolkit_version
+ARG cnnl_version
+ARG cnnlextra_version
+ARG cncl_version
+ARG cndali_version
+ARG python_version
+
+LABEL "com.cambricon.driver"=${driver_version}       \
+      "com.cambricon.cntoolkit"=${cntoolkit_version} \
+      "com.cambricon.cnnl"=${cnnl_version}           \
+      "com.cambricon.cndali"=${cndali_version}       \
+      "com.cambricon.cnnlextra"=${cnnlextra_version} \
+      "com.cambricon.cncl"=${cncl_version}           \
+      "com.cambricon.python"=${python_version}
+
+RUN ln -sf /usr/bin/python3 /usr/bin/python && ln -sf /bin/python3 /bin/python
+RUN apt-get update && apt-get install -y language-pack-zh-hans
+
+# For torchaudio installtion, we don't download and install the official torchaudio whl package,
+# because the libstdc++.so.6.0.25 version on this system can't meet the requirement of official whl package.
+# If we used it, the '_ZNSt19basic_ostringstreamIcSt11char_traitsIcESaIcEEC1Ev' symbol will not be found
+# when importing audio. The official whl package is compiled by using higier gcc version.
+# so we just compile the torchaudio source code temporarily.
+RUN mkdir -p /torch/src && \
+    pushd /torch/src && \
+    echo $catch_branch $vision_branch $pytorch_models_branch $audio_branch && \
+    git clone http://gitlab.software.cambricon.com/neuware/pytorch.git -b $pytorch_branch --depth 1 && \
+    git clone http://gitlab.software.cambricon.com/neuware/catch.git -b $catch_branch --depth 1 && \
+    git clone http://gitlab.software.cambricon.com/neuware/vision.git -b $vision_branch --depth 1 && \
+    git clone http://gitlab.software.cambricon.com/neuware/pytorch_models.git -b $pytorch_models_branch --depth 1 && \
+    git clone http://gitlab.software.cambricon.com/neuware/software/framework/pytorch/audio.git -b $audio_branch --depth 1 && \
+    mkdir -p /workspace && pushd /workspace && \
+    git clone http://gitlab.software.cambricon.com/neuware/platform/cair_modelzoo.git -b $benchmark_version --depth 1 && \
+    popd
+
+RUN cat /torch/src/pytorch/requirements.txt /torch/src/catch/requirements.txt > /torch/requirements.txt
+
+# create neuware package
+RUN pushd /torch && bash /torch/src/catch/scripts/release/independent_build.sh -r dep -o ubuntu -v 20.04
+
+# set env
+ENV NEUWARE_HOME=/torch/neuware_home
+ENV USE_NINJA=OFF
+ENV LD_LIBRARY_PATH=${NEUWARE_HOME}/lib64:$LD_LIBRARY_PATH
+ENV PYTORCH_HOME=/torch/src/pytorch
+
+# set pip source
+RUN PIP_CONF_DIR=${HOME}/.config/pip && mkdir -p ${PIP_CONF_DIR} && \
+    echo "[global]" > ${PIP_CONF_DIR}/pip.conf && \
+    echo "index-url = https://pypi.tuna.tsinghua.edu.cn/simple/" \
+          >> ${PIP_CONF_DIR}/pip.conf && \
+    echo "extra-index-url = https://mirrors.aliyun.com/pypi/simple/" >> ${PIP_CONF_DIR}/pip.conf && \
+    echo "                  http://mirrors.cambricon.com/pypi/web/simple/" >> ${PIP_CONF_DIR}/pip.conf && \
+    echo "[install]" >> ${PIP_CONF_DIR}/pip.conf && \
+    echo "trusted-host = pypi.tuna.tsinghua.edu.cn" >> ${PIP_CONF_DIR}/pip.conf && \
+    echo "               mirrors.cambricon.com" >> ${PIP_CONF_DIR}/pip.conf && \
+    echo "               mirrors.aliyun.com" >> ${PIP_CONF_DIR}/pip.conf
+
+RUN cat ${HOME}/.config/pip/pip.conf
+
+
+RUN if [[ ${python_version} == "3.10" ]]; then pushd /torch \
+# see https://github.com/pypa/pip/issues/4924
+&& mv /usr/bin/lsb_release /usr/bin/lsb_release_back \
+&& /opt/py3.10/bin/pip3.10 install virtualenv \
+&& /opt/py3.10/bin/virtualenv -p /opt/py3.10/bin/python3.10 venv3/pytorch \
+&& source venv3/pytorch/bin/activate \
+&& pip install -r requirements.txt \
+&& pip install setuptools==59.5.0 \
+&& pip install /torch/wheel_py310/torch-*.whl \
+&& pip install /torch/wheel_py310/torch_mlu-*.whl \
+&& pip install /torch/wheel_py310/torchvision*.whl \
+&& wget http://daily.software.cambricon.com/release/dali/${cndali_version}/wheel/cambricon_dali-${cndali_version}-py3-none-manylinux2014_x86_64.whl -nv \
+&& pip install cambricon_dali-${cndali_version}-py3-none-manylinux2014_x86_64.whl \
+&& rm cambricon_dali-${cndali_version}-py3-none-manylinux2014_x86_64.whl \
+&& wget http://gitlab.software.cambricon.com/neuware/software/framework/pytorch/extra-dependencies/raw/master/dllogger/dllogger.tar -nv \
+&& tar -xvf dllogger.tar     \
+&& rm dllogger.tar    \
+&& cd dllogger \
+&& python setup.py install \
+&& rm -rf dllogger \
+&& cd /torch/src/audio \
+&& pip install -r requirements.txt \
+&& pip install ninja \
+&& python setup.py install \
+&& rm -rf /torch/src/audio \
+&& popd; \
+fi
+
+RUN sed -i '$asource /torch/venv3/pytorch/bin/activate' ~/.bashrc
+
+RUN pushd /torch/src && \
+    ./catch/scripts/release/catch_trim_files.sh
+
+# install jupyter
+RUN pushd /torch \
+&& source venv3/pytorch/bin/activate \
+&& pip install jupyterlab \
+&& pip install ipywidgets
+
+ENV PATH="/torch/venv3/pytorch/bin:$PATH"
+
+RUN sed -i '/mirrors.cambricon.com/d' ${HOME}/.config/pip/pip.conf

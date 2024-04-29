@@ -1,0 +1,64 @@
+diff --git a/torch/functional.py b/torch/functional.py
+index 3c0919a1f8..daebefda1e 100644
+--- a/torch/functional.py
++++ b/torch/functional.py
+@@ -29,6 +29,7 @@ __all__ = [
+     'chain_matmul',
+     'einsum',
+     'istft',
++    'is_mlu_available',
+     'lu',
+     'norm',
+     'meshgrid',
+@@ -41,6 +42,12 @@ __all__ = [
+     'unique_consecutive',
+ ]
+ 
++def is_mlu_available():
++    try:
++        import torch_mlu
++        return True
++    except ImportError:
++        return False
+
+ 
+ def broadcast_tensors(*tensors):
+     r"""broadcast_tensors(*tensors) -> List of Tensors
+diff --git a/torch/utils/data/_utils/pin_memory.py b/torch/utils/data/_utils/pin_memory.py
+index d3aa9118cb..07b0e0ddc9 100644
+--- a/torch/utils/data/_utils/pin_memory.py
++++ b/torch/utils/data/_utils/pin_memory.py
+@@ -19,7 +19,10 @@ def _pin_memory_loop(in_queue, out_queue, device_id, done_event, device):
+     # consuming all CPU cores.
+     torch.set_num_threads(1)
+ 
+-    torch.cuda.set_device(device_id)
++    if  torch.is_mlu_available():
++        torch.mlu.set_device(device_id)
++    else:
++        torch.cuda.set_device(device_id)
+ 
+     def do_one_step():
+         try:
+diff --git a/torch/utils/data/dataloader.py b/torch/utils/data/dataloader.py
+index eac52ba29c..5bcb71e523 100644
+--- a/torch/utils/data/dataloader.py
++++ b/torch/utils/data/dataloader.py
+@@ -583,7 +583,7 @@ class _BaseDataLoaderIter(object):
+         # default behaviour is CUDA device. if pin_memory_device is selected
+         # and pin_memory is not set, the default behaviour false.
+         if (len(loader.pin_memory_device) == 0):
+-            self._pin_memory = loader.pin_memory and torch.cuda.is_available()
++            self._pin_memory = loader.pin_memory and (torch.cuda.is_available() or torch.is_mlu_available())
+             self._pin_memory_device = None
+         else:
+             if not loader.pin_memory:
+@@ -1043,7 +1043,7 @@ class _MultiProcessingDataLoaderIter(_BaseDataLoaderIter):
+             pin_memory_thread = threading.Thread(
+                 target=_utils.pin_memory._pin_memory_loop,
+                 args=(self._worker_result_queue, self._data_queue,
+-                      torch.cuda.current_device(),
++                      torch.mlu.current_device() if torch.is_mlu_available() else torch.cuda.current_device(),
+                       self._pin_memory_thread_done_event, self._pin_memory_device))
+             pin_memory_thread.daemon = True
+             pin_memory_thread.start()

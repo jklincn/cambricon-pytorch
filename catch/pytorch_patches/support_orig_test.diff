@@ -1,0 +1,335 @@
+diff --git a/torch/testing/_comparison.py b/torch/testing/_comparison.py
+index 5cd2482ac8..9d491a1839 100644
+--- a/torch/testing/_comparison.py
++++ b/torch/testing/_comparison.py
+@@ -850,14 +850,18 @@ class TensorLikePair(Pair):
+     ) -> None:
+         """Checks if the values of two tensors are close up to a desired tolerance."""
+         actual, expected = self._promote_for_comparison(actual, expected)
+-        matches = torch.isclose(actual, expected, rtol=rtol, atol=atol, equal_nan=equal_nan)
++        # TODO(PYTORCH-9163): isclose failed, fallback to cpu.
++        matches = torch.isclose(actual.cpu(), expected.cpu(), rtol=rtol, atol=atol, equal_nan=equal_nan)
++        # matches = torch.isclose(actual, expected, rtol=rtol, atol=atol, equal_nan=equal_nan)
+         if torch.all(matches):
+             return
+
+         if actual.shape == torch.Size([]):
+             msg = make_scalar_mismatch_msg(actual.item(), expected.item(), rtol=rtol, atol=atol, identifier=identifier)
+         else:
+-            msg = make_tensor_mismatch_msg(actual, expected, ~matches, rtol=rtol, atol=atol, identifier=identifier)
++            # TODO(PYTORCH-9163): isclose failed, fallback to cpu.
++            msg = make_tensor_mismatch_msg(actual.cpu(), expected.cpu(), ~matches, rtol=rtol, atol=atol, identifier=identifier)
++            # msg = make_tensor_mismatch_msg(actual, expected, ~matches, rtol=rtol, atol=atol, identifier=identifier)
+         raise self._make_error_meta(AssertionError, msg)
+
+     def _promote_for_comparison(
+diff --git a/torch/testing/_creation.py b/torch/testing/_creation.py
+index bb9730c5c0..83761a9f84 100644
+--- a/torch/testing/_creation.py
++++ b/torch/testing/_creation.py
+@@ -106,6 +106,19 @@ def make_tensor(
+
+         return low, high
+
++    # TODO(PYTORCH-8723):
++    # Currently, use cpu make_tensor and copy result to mlu if device is mlu.
++    # In order not to block the ut test.
++    # device: Union[str, torch.device]
++    org_device = device
++    mlu_convert_to_cpu = False
++    if isinstance(device, str) and "mlu" in device:
++        device = 'cpu'
++        mlu_convert_to_cpu = True
++    if isinstance(device, torch.device) and device.type == "mlu":
++        device = 'cpu'
++        mlu_convert_to_cpu = True
++
+     if len(shape) == 1 and isinstance(shape[0], collections.abc.Sequence):
+         shape = shape[0]  # type: ignore[assignment]
+     shape = cast(Tuple[int, ...], tuple(shape))
+@@ -159,6 +172,8 @@ def make_tensor(
+             replace_with = torch.complex(float_eps, float_eps)
+         result[result == 0] = replace_with
+
++    # TODO(PYTORCH-8723): Copy CPU Tensor to MLU
++    result = result.to(org_device) if mlu_convert_to_cpu else result
+     if dtype in _floating_types + _complex_types:
+         result.requires_grad = requires_grad
+
+diff --git a/torch/testing/_internal/common_device_type.py b/torch/testing/_internal/common_device_type.py
+index 855740583e..d81168cbe0 100644
+--- a/torch/testing/_internal/common_device_type.py
++++ b/torch/testing/_internal/common_device_type.py
+@@ -487,6 +487,30 @@ class CUDATestBase(DeviceTypeTestBase):
+         # Acquires the current device as the primary (test) device
+         cls.primary_device = 'cuda:{0}'.format(torch.cuda.current_device())
+
++if torch.is_mlu_available():
++    class MLUTestBase(DeviceTypeTestBase):
++        device_type = 'mlu'
++        def has_cudnn(self):
++            return True
++
++        @classmethod
++        def get_primary_device(cls):
++            if hasattr(cls, "primary_device"):
++                return cls.primary_device
++            else:
++                cls.primary_device = 'mlu:{0}'.format(torch.mlu.current_device())
++                return cls.primary_device
++
++        @classmethod
++        def get_all_devices(cls):
++            primary_device_idx = int(cls.get_primary_device().split(':')[1])
++            num_devices = torch.mlu.device_count()
++
++            prim_device = cls.get_primary_device()
++            mlu_str = 'mlu:{0}'
++            non_primary_devices = [mlu_str.format(idx) for idx in range(num_devices) if idx != primary_device_idx]
++            return [prim_device] + non_primary_devices
++
+ # See Note [Lazy Tensor tests in device agnostic testing]
+ lazy_ts_backend_init = False
+ class LazyTestBase(DeviceTypeTestBase):
+@@ -535,6 +559,8 @@ def get_device_type_test_bases():
+         # ramping up support.
+         # elif torch.backends.mps.is_available():
+         #   test_bases.append(MPSTestBase)
++        if torch.is_mlu_available():
++            test_bases.append(MLUTestBase)
+
+     return test_bases
+
+@@ -792,7 +818,10 @@ class ops(_TestParametrizer):
+             else:
+                 raise RuntimeError(f"Unknown OpDType: {self.opinfo_dtypes}")
+
+-            if self.allowed_dtypes is not None:
++            # When self.opinfo_dtypes == OpDTypes.any_one, dtypes may be empty.
++            # But self.allowed_dtypes may be set with some value to exclude 64bit dtype in mlu.
++            # So it's necessary to check dtypes to avoid error raised for empty {} calling intersection.
++            if dtypes and self.allowed_dtypes is not None:
+                 dtypes = dtypes.intersection(self.allowed_dtypes)
+ 
+             # Construct the test name; device / dtype parts are handled outside.
+
+diff --git a/torch/testing/_internal/common_utils.py b/torch/testing/_internal/common_utils.py
+index e32850908d..37c5e49e89 100644
+--- a/torch/testing/_internal/common_utils.py
++++ b/torch/testing/_internal/common_utils.py
+@@ -125,7 +125,7 @@ if os.getenv("DISABLED_TESTS_FILE", ""):
+         disabled_tests_dict = json.load(fp)
+         warnings.warn(f"loaded {len(disabled_tests_dict)} disabled tests")
+
+-NATIVE_DEVICES = ('cpu', 'cuda', 'meta')
++NATIVE_DEVICES = ('cpu', 'cuda', 'meta', 'mlu')
+
+
+ class _TestParametrizer(object):
+@@ -1335,6 +1335,25 @@ def to_gpu(obj, type_map=None):
+     else:
+         return deepcopy(obj)
+
++def to_mlu(obj, type_map=None):
++    if type_map is None:
++        type_map = {}
++    if isinstance(obj, torch.Tensor):
++        assert obj.is_leaf
++        t = type_map.get(obj.dtype, obj.dtype)
++        with torch.no_grad():
++            res = obj.clone().to(dtype=t, device="mlu")
++            res.requires_grad = obj.requires_grad
++        return res
++    elif torch.is_storage(obj):
++        return obj.new().resize_(obj.size()).copy_(obj)
++    elif isinstance(obj, list):
++        return [to_mlu(o, type_map) for o in obj]
++    elif isinstance(obj, tuple):
++        return tuple(to_mlu(o, type_map) for o in obj)
++    else:
++        return deepcopy(obj)
++
+
+ def get_function_arglist(func):
+     return inspect.getfullargspec(func).args
+@@ -1362,10 +1381,15 @@ def freeze_rng_state():
+     # Some OpInfos use freeze_rng_state for rng determinism, but
+     # test_composite_compliance overrides dispatch for all torch functions
+     # which we need to disable to get and set rng state
++    if torch.is_mlu_available():
++        import torch_mlu
++
+     with no_dispatch(), disable_functorch():
+         rng_state = torch.get_rng_state()
+         if torch.cuda.is_available():
+             cuda_rng_state = torch.cuda.get_rng_state()
++        if torch.mlu.is_available():
++            mlu_rng_state = torch.mlu.get_rng_state()
+     try:
+         yield
+     finally:
+@@ -1378,6 +1402,8 @@ def freeze_rng_state():
+         with no_dispatch(), disable_functorch():
+             if torch.cuda.is_available():
+                 torch.cuda.set_rng_state(cuda_rng_state)
++            if torch.mlu.is_available():
++                torch.mlu.set_rng_state(mlu_rng_state)
+             torch.set_rng_state(rng_state)
+
+ @contextlib.contextmanager
+@@ -2952,11 +2978,18 @@ def noncontiguous_like(t):
+     else:
+         value = 12
+
++    device = str(t.device)
++    requires_grad = t.requires_grad
++    # TODO():fill not implement complex64
++    if 'mlu' in device and t.dtype == torch.complex64:
++        t=t.cpu()
+     result = t.new_empty(t.shape + (2,))
+     result[..., 0] = value
+     result[..., 1] = t.detach()
+     result = result[..., 1]
+-    result.requires_grad_(t.requires_grad)
++    result.requires_grad_(requires_grad)
++    if 'mlu' in device and t.dtype == torch.complex64:
++        result = to_mlu(result)
+     return result
+
+ # TODO: remove this (prefer make_symmetric_matrices below)
+diff --git a/torch/testing/_internal/opinfo/core.py b/torch/testing/_internal/opinfo/core.py
+index d59e92111d..64cf95b82f 100644
+--- a/torch/testing/_internal/opinfo/core.py
++++ b/torch/testing/_internal/opinfo/core.py
+@@ -704,6 +704,9 @@ class OpInfo(object):
+     # dtypes this function is expected to work with on CUDA
+     dtypesIfCUDA: _dispatch_dtypes = None
+
++    # dtypes this function is expected to work with on MLU
++    dtypesIfMLU: _dispatch_dtypes = None
++
+     # dtypes this function is expected to work with on ROCM
+     dtypesIfROCM: _dispatch_dtypes = None
+
+@@ -713,6 +716,9 @@ class OpInfo(object):
+     # backward dtypes this function is expected to work with on CUDA
+     backward_dtypesIfCUDA: _dispatch_dtypes = None
+
++    # backward dtypes this function is expected to work with on MLU
++    backward_dtypesIfMLU: _dispatch_dtypes = None
++
+     # backward dtypes this function is expected to work with on ROCM
+     backward_dtypesIfROCM: _dispatch_dtypes = None
+
+@@ -851,7 +857,7 @@ class OpInfo(object):
+             self.name
+         )
+
+-        dtypes_args = (self.dtypes, self.dtypesIfCUDA, self.dtypesIfROCM)
++        dtypes_args = (self.dtypes, self.dtypesIfCUDA, self.dtypesIfROCM, self.dtypesIfMLU)
+
+         # Validates the dtypes are generated from the dispatch-related functions
+         for dtype_list in dtypes_args:
+@@ -909,6 +915,11 @@ class OpInfo(object):
+                 else self.dtypes
+             )
+         )
++        self.backward_dtypesIfMLU = (
++            set(self.backward_dtypesIfMLU)
++            if self.backward_dtypesIfMLU is not None
++            else self.backward_dtypesIfCUDA
++        )
+         self.backward_dtypes = (
+             set(self.backward_dtypes)
+             if self.backward_dtypes is not None
+@@ -918,6 +929,9 @@ class OpInfo(object):
+         self.dtypesIfCUDA = (
+             set(self.dtypesIfCUDA) if self.dtypesIfCUDA is not None else self.dtypes
+         )
++        self.dtypesIfMLU = (
++            set(self.dtypesIfMLU) if self.dtypesIfMLU is not None else self.dtypesIfCUDA
++        )
+         self.dtypesIfROCM = (
+             set(self.dtypesIfROCM)
+             if self.dtypesIfROCM is not None
+@@ -1217,6 +1231,8 @@ class OpInfo(object):
+             return self.dtypes
+         if device_type == "cuda":
+             return self.dtypesIfROCM if TEST_WITH_ROCM else self.dtypesIfCUDA
++        elif device_type.find("mlu") == 0:
++            return self.dtypesIfMLU
+         else:
+             return self.dtypes
+
+@@ -1233,6 +1249,8 @@ class OpInfo(object):
+                 if TEST_WITH_ROCM
+                 else self.backward_dtypesIfCUDA
+             )
++        elif device_type == "mlu":
++            backward_dtypes = self.backward_dtypesIfMLU
+         else:
+             backward_dtypes = self.backward_dtypes
+
+@@ -1732,7 +1750,13 @@ def generate_elementwise_binary_extremal_value_tensors(
+     lhs = make_tensor(
+         (128, 128), device=device, dtype=dtype, requires_grad=requires_grad
+     )
+-    lhs.flatten()[::3] = nan
++    # TODO(PYTORCH-9119): flatten() + slice fallback failed, using cpu tensor.
++    if isinstance(rhs, torch.Tensor) and rhs.device.type == "mlu":
++        rhs_cpu = rhs.cpu().flatten()
++        rhs_cpu[::3] = nan
++        rhs.copy_(rhs_cpu.reshape_as(rhs))
++    else:
++        rhs.flatten()[::3] = nan
+     rhs = make_tensor(
+         (128, 128), device=device, dtype=dtype, requires_grad=requires_grad
+     )
+@@ -2520,6 +2544,7 @@ class ShapeFuncInfo(OpInfo):
+         ref,  # a reference function
+         dtypes=floating_types(),
+         dtypesIfCUDA=None,
++        dtypesIfMLU=None,
+         dtypesIfROCM=None,
+         sample_inputs_func=None,
+         **kwargs,
+@@ -2528,6 +2553,7 @@ class ShapeFuncInfo(OpInfo):
+             name,
+             dtypes=dtypes,
+             dtypesIfCUDA=dtypesIfCUDA,
++            dtypesIfMLU=dtypesIfMLU,
+             dtypesIfROCM=dtypesIfROCM,
+             sample_inputs_func=sample_inputs_func,
+             **kwargs,
+@@ -2573,6 +2599,7 @@ class ForeachFuncInfo(OpInfo):
+         name,
+         dtypes=floating_and_complex_types(),
+         dtypesIfCUDA=floating_and_complex_types_and(torch.half),
++        dtypesIfMLU=floating_and_complex_types_and(torch.half),
+         dtypesIfROCM=None,
+         supports_alpha_param=False,
+         sample_inputs_func=sample_inputs_foreach,
+@@ -2582,6 +2609,7 @@ class ForeachFuncInfo(OpInfo):
+             "_foreach_" + name,
+             dtypes=dtypes,
+             dtypesIfCUDA=dtypesIfCUDA,
++            dtypesIfMLU=dtypesIfMLU,
+             dtypesIfROCM=dtypesIfROCM,
+             sample_inputs_func=sample_inputs_func,
+             **kwargs,
+diff --git a/torch/testing/_internal/schema_check_mode.py b/torch/testing/_internal/schema_check_mode.py
+index 9d118719af..f2564d6108 100644
+--- a/torch/testing/_internal/schema_check_mode.py
++++ b/torch/testing/_internal/schema_check_mode.py
+@@ -45,7 +45,9 @@ class SchemaCheckMode(TorchDispatchMode):
+             if are_tensors and before.layout != torch.sparse_csr and after.layout != torch.sparse_csr:
+                 return not (
+                     before.size() == after.size() and
+-                    torch.allclose(before, after, equal_nan=True) and
++                    # TODO(PYTORCH-9163): fallback allclose to cpu.
++                    torch.allclose(before.cpu(), after.cpu(), equal_nan=True) and
++                    # torch.allclose(before, after, equal_nan=True) and
+                     md[0] == after.stride() and
+                     md[1] == after.storage()._cdata
+                 )
+

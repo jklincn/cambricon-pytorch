@@ -1,0 +1,14 @@
+diff --git a/torch/autograd/graph.py b/torch/autograd/graph.py
+index d3aece1283..9beeaeb024 100644
+--- a/torch/autograd/graph.py
++++ b/torch/autograd/graph.py
+@@ -124,7 +124,8 @@ class save_on_cpu(saved_tensors_hooks):
+                 tensor.size(),
+                 dtype=tensor.dtype,
+                 layout=tensor.layout,
+-                pin_memory=(torch.cuda.is_available() and not tensor.is_sparse))
++                pin_memory=((torch.cuda.is_available() or torch.mlu.is_available())
++                            and not tensor.is_sparse))
+             packed.copy_(tensor)
+             return (tensor.device, packed)
+ 

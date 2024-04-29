@@ -1,0 +1,13 @@
+diff --git a/aten/src/ATen/native/Dropout.cpp b/aten/src/ATen/native/Dropout.cpp
+index 9c5cd25f45..4065cc44f2 100644
+--- a/aten/src/ATen/native/Dropout.cpp
++++ b/aten/src/ATen/native/Dropout.cpp
+@@ -26,7 +26,7 @@ Tensor make_feature_noise(const Tensor& input) {
+ }
+
+ bool is_fused_kernel_acceptable(const Tensor& input, double p) {
+-  return (input.is_cuda() || input.is_xpu() || input.is_lazy()) && p > 0 && p < 1 && input.sym_numel() > 0;
++  return (input.is_cuda() || input.is_mlu() || input.is_xpu() || input.is_lazy()) && p > 0 && p < 1 && input.sym_numel() > 0;
+ }
+
+ // NB: sure, we could have used different overloads here, but I would feel insecure

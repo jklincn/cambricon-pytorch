@@ -1,0 +1,297 @@
+diff --git a/third_party/kineto/libkineto/CMakeLists.txt b/third_party/kineto/libkineto/CMakeLists.txt
+index 1fd7f0d522..b136bb22ee 100644
+--- a/third_party/kineto/libkineto/CMakeLists.txt
++++ b/third_party/kineto/libkineto/CMakeLists.txt
+@@ -22,6 +22,7 @@ project(kineto VERSION 0.1 LANGUAGES CXX C)
+ set(KINETO_LIBRARY_TYPE "default" CACHE STRING
+   "Type of library (default, static or shared) to build")
+ set_property(CACHE KINETO_LIBRARY_TYPE PROPERTY STRINGS default shared)
++set(KINETO_LIBRARY_TYPE "shared")
+ option(KINETO_BUILD_TESTS "Build kineto unit tests" ON)
+ 
+ set(LIBKINETO_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
+@@ -57,13 +58,13 @@ endif()
+ 
+ # Define file lists
+ if (LIBKINETO_NOCUPTI AND LIBKINETO_NOROCTRACER)
+-    get_filelist("get_libkineto_cpu_only_srcs(with_api=False)" LIBKINETO_SRCS)
++    get_filelist("get_libkineto_cpu_only_srcs(with_api=True)" LIBKINETO_SRCS)
+     message(INFO " CUPTI unavailable or disabled - not building GPU profilers")
+ elseif(NOT LIBKINETO_NOROCTRACER)
+-    get_filelist("get_libkineto_roctracer_srcs(with_api=False)" LIBKINETO_SRCS)
++    get_filelist("get_libkineto_roctracer_srcs(with_api=True)" LIBKINETO_SRCS)
+     message(INFO " Building with roctracer")
+ else()
+-    get_filelist("get_libkineto_cupti_srcs(with_api=False)" LIBKINETO_SRCS)
++    get_filelist("get_libkineto_cupti_srcs(with_api=True)" LIBKINETO_SRCS)
+ endif()
+ get_filelist("get_libkineto_public_headers()" LIBKINETO_PUBLIC_HEADERS)
+ get_filelist("get_libkineto_api_srcs()" LIBKINETO_API_SRCS)
+@@ -163,8 +164,6 @@ elseif(KINETO_LIBRARY_TYPE STREQUAL "shared")
+   add_library(kineto SHARED
+     $<TARGET_OBJECTS:kineto_base>)
+   set_property(TARGET kineto_base PROPERTY POSITION_INDEPENDENT_CODE ON)
+-  set_target_properties(kineto PROPERTIES
+-    CXX_VISIBILITY_PRESET hidden)
+ else()
+   message(FATAL_ERROR "Unsupported library type ${KINETO_LIBRARY_TYPE}")
+ endif()
+@@ -183,8 +182,8 @@ target_link_libraries(kineto $<BUILD_INTERFACE:fmt::fmt-header-only>)
+ add_dependencies(kineto fmt::fmt-header-only)
+ 
+ install(TARGETS kineto EXPORT kinetoLibraryConfig
+-  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+-  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
++  ARCHIVE DESTINATION "lib"
++  LIBRARY DESTINATION "lib")
+ 
+ install(FILES ${LIBKINETO_PUBLIC_HEADERS}
+   DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/kineto")
+diff --git a/third_party/kineto/libkineto/include/ActivityType.h b/third_party/kineto/libkineto/include/ActivityType.h
+index 1ddf75595d..a1c8dc509e 100644
+--- a/third_party/kineto/libkineto/include/ActivityType.h
++++ b/third_party/kineto/libkineto/include/ActivityType.h
+@@ -27,6 +27,14 @@ enum class ActivityType {
+     GLOW_RUNTIME, // host side glow runtime events
+     CUDA_PROFILER_RANGE, // CUPTI Profiler range for performance metrics
+ 
++    // Activity types for MLU
++    MLU_USER_ANNOTATION,
++    MLU_MEMCPY,
++    MLU_MEMSET,
++    MLU_CONCURRENT_KERNEL, // on-device kernels
++    MLU_RUNTIME,
++    MLU_PROFILER_RANGE,
++
+     ENUM_COUNT, // This is to add buffer and not used for any profiling logic. Add your new type before it.
+     OPTIONAL_ACTIVITY_TYPE_START = GLOW_RUNTIME,
+ };
+diff --git a/torch/autograd/profiler.py b/torch/autograd/profiler.py
+index dd5700f949..8427bfe971 100644
+--- a/torch/autograd/profiler.py
++++ b/torch/autograd/profiler.py
+@@ -149,11 +149,13 @@ class profile(object):
+             with_modules=False,
+             use_kineto=False,
+             use_cpu=True,
+-            experimental_config=None):
++            experimental_config=None,
++            use_mlu=False):
+         self.enabled: bool = enabled
+         if not self.enabled:
+             return
+         self.use_cuda = use_cuda
++        self.use_mlu = use_mlu
+         self.function_events: Optional[EventList] = None
+         self.entered = False
+         self.record_shapes = record_shapes
+@@ -176,6 +178,10 @@ class profile(object):
+             warn("CUDA is not available, disabling CUDA profiling")
+             self.use_cuda = False
+ 
++        if self.use_mlu and not torch.is_mlu_available():
++            warn("MLU is not available, disabling MLU profiling")
++            self.use_mlu = False
++
+         self.kineto_activities = set()
+         if self.use_cpu:
+             self.kineto_activities.add(ProfilerActivity.CPU)
+@@ -189,6 +195,9 @@ class profile(object):
+             else:
+                 self.kineto_activities.add(ProfilerActivity.CUDA)
+ 
++        if self.use_mlu:
++            self.kineto_activities.add(ProfilerActivity.MLU)
++
+         assert len(self.kineto_activities) > 0, \
+             "No activities specified for the profiler"
+ 
+@@ -214,6 +223,9 @@ class profile(object):
+ 
+     def _prepare_trace(self):
+         self.entered = True
++        if self.use_mlu:
++            from torch_mlu.profiler.profile_mlu import _enable_mlu_profiler
++            _enable_mlu_profiler()
+         _prepare_profiler(self.config(), self.kineto_activities)
+ 
+     def _start_trace(self):
+@@ -225,11 +237,13 @@ class profile(object):
+             return
+         if self.use_cuda:
+             torch.cuda.synchronize()
++        if self.use_mlu:
++            torch.mlu.synchronize()
+         self.kineto_results = _disable_profiler()
+         parsed_results = self._parse_kineto_results(self.kineto_results)
+         self.function_events = EventList(
+             parsed_results,
+-            use_cuda=self.use_cuda,
++            use_cuda=self.use_cuda or self.use_mlu,
+             profile_memory=self.profile_memory,
+             with_flops=self.with_flops)
+         self.function_events._build_tree()
+@@ -325,6 +339,11 @@ class profile(object):
+                 mem_record.device_type() in [DeviceType.CUDA, DeviceType.HIP] \
+                 else 0
+ 
++        def _mlu_memory_usage(mem_record):
++            return mem_record.nbytes() if \
++                mem_record.device_type() in [DeviceType.MLU] \
++                else 0
++
+         # Create and return FunctionEvent list
+         function_events = []
+         cuda_corr_map: Dict[int, List[FunctionEvent]] = {}
+@@ -338,11 +357,13 @@ class profile(object):
+ 
+             cpu_memory_usage = 0
+             cuda_memory_usage = 0
++            mlu_memory_usage = 0
+             if kineto_event.device_type() == DeviceType.CPU:
+                 # find the corresponding memory allocation events
+                 for mem_record in mem_records_acc.in_interval(kineto_event.start_us(), abs_end_us):
+                     cpu_memory_usage += _cpu_memory_usage(mem_record[0])
+                     cuda_memory_usage += _cuda_memory_usage(mem_record[0])
++                    mlu_memory_usage += _mlu_memory_usage(mem_record[0])
+                     mem_record[1] = True
+ 
+             is_async = kineto_event.is_async() or (
+@@ -361,7 +382,7 @@ class profile(object):
+                 stack=[entry for entry in kineto_event.stack() if _filter_stack_entry(entry)],
+                 scope=kineto_event.scope(),
+                 cpu_memory_usage=cpu_memory_usage,
+-                cuda_memory_usage=cuda_memory_usage,
++                cuda_memory_usage=mlu_memory_usage if torch.is_mlu_available() else cuda_memory_usage,
+                 is_async=is_async,
+                 sequence_nr=kineto_event.sequence_nr(),
+                 device_type=kineto_event.device_type(),
+@@ -390,7 +411,7 @@ class profile(object):
+             if (fe.device_type == DeviceType.CPU and not fe.is_async and
+                     fe.id in cuda_corr_map):
+                 for f_evt in cuda_corr_map[fe.id]:
+-                    if f_evt.device_type == DeviceType.CUDA:
++                    if f_evt.device_type == DeviceType.CUDA or f_evt.device_type == DeviceType.MLU:
+                         fe.append_kernel(
+                             f_evt.name,
+                             f_evt.device_index,
+@@ -416,7 +437,8 @@ class profile(object):
+                 stack=[],
+                 scope=0,  # RecordScope::FUNCTION
+                 cpu_memory_usage=_cpu_memory_usage(evt),
+-                cuda_memory_usage=_cuda_memory_usage(evt),
++                cuda_memory_usage=_mlu_memory_usage(evt) if torch.is_mlu_available() \
++                                    else _cuda_memory_usage(evt),
+                 is_async=False,
+                 sequence_nr=-1,
+                 device_type=DeviceType.CPU,
+diff --git a/torch/csrc/autograd/init.cpp b/torch/csrc/autograd/init.cpp
+index a1d6de21d1..824b6152c2 100644
+--- a/torch/csrc/autograd/init.cpp
++++ b/torch/csrc/autograd/init.cpp
+@@ -129,6 +129,7 @@ PyObject* THPAutograd_initExtension(PyObject* _unused, PyObject* unused) {
+   py::enum_<c10::DeviceType>(m, "DeviceType")
+       .value("CPU", c10::DeviceType::CPU)
+       .value("CUDA", c10::DeviceType::CUDA)
++      .value("MLU", c10::DeviceType::MLU)
+       .value("MKLDNN", c10::DeviceType::MKLDNN)
+       .value("OPENGL", c10::DeviceType::OPENGL)
+       .value("OPENCL", c10::DeviceType::OPENCL)
+diff --git a/torch/csrc/autograd/profiler_python.cpp b/torch/csrc/autograd/profiler_python.cpp
+index 257c956cc4..8922dcf5f2 100644
+--- a/torch/csrc/autograd/profiler_python.cpp
++++ b/torch/csrc/autograd/profiler_python.cpp
+@@ -804,7 +804,7 @@ void PythonTracer::recordCCall(
+     ThreadLocalResults& tls,
+     PyFrameObject* frame,
+     PyObject* arg) {
+-  TORCH_INTERNAL_ASSERT_DEBUG_ONLY(Py_TYPE(arg) == &PyCFunction_Type);
++  TORCH_INTERNAL_ASSERT_DEBUG_ONLY(PyCFunction_Check(arg));
+   auto fn = reinterpret_cast<PyCFunctionObject*>(arg);
+ 
+   // NB: For C calls a new frame is not created, so we use `frame` rather than
+diff --git a/torch/csrc/profiler/kineto_shim.cpp b/torch/csrc/profiler/kineto_shim.cpp
+index bf84d32792..6f5a1b7315 100644
+--- a/torch/csrc/profiler/kineto_shim.cpp
++++ b/torch/csrc/profiler/kineto_shim.cpp
+@@ -291,10 +291,17 @@ c10::DeviceType deviceTypeFromActivity(libkineto::ActivityType activity_type) {
+     case libkineto::ActivityType::GPU_USER_ANNOTATION:
+     case libkineto::ActivityType::CUDA_PROFILER_RANGE:
+       return c10::DeviceType::CUDA;
++    case libkineto::ActivityType::MLU_MEMCPY:
++    case libkineto::ActivityType::MLU_MEMSET:
++    case libkineto::ActivityType::MLU_CONCURRENT_KERNEL:
++    case libkineto::ActivityType::MLU_USER_ANNOTATION:
++    case libkineto::ActivityType::MLU_PROFILER_RANGE:
++      return c10::DeviceType::MLU;
+     case libkineto::ActivityType::CPU_OP:
+     case libkineto::ActivityType::USER_ANNOTATION:
+     case libkineto::ActivityType::EXTERNAL_CORRELATION:
+     case libkineto::ActivityType::CUDA_RUNTIME:
++    case libkineto::ActivityType::MLU_RUNTIME:
+     case libkineto::ActivityType::CPU_INSTANT_EVENT:
+     case libkineto::ActivityType::GLOW_RUNTIME:
+     case libkineto::ActivityType::PYTHON_FUNCTION:
+diff --git a/torch/csrc/profiler/orchestration/observer.h b/torch/csrc/profiler/orchestration/observer.h
+index 3b75a91804..97fbdf1602 100644
+--- a/torch/csrc/profiler/orchestration/observer.h
++++ b/torch/csrc/profiler/orchestration/observer.h
+@@ -13,6 +13,7 @@ namespace impl {
+ enum class C10_API_ENUM ActivityType {
+   CPU = 0,
+   CUDA, // CUDA kernels, runtime
++  MLU, // MLU kernels, runtime
+   NUM_KINETO_ACTIVITIES, // must be the last one
+ };
+ 
+diff --git a/torch/csrc/profiler/python/init.cpp b/torch/csrc/profiler/python/init.cpp
+index 9e1b663d65..57166ed548 100644
+--- a/torch/csrc/profiler/python/init.cpp
++++ b/torch/csrc/profiler/python/init.cpp
+@@ -46,7 +46,8 @@ void initPythonBindings(PyObject* module) {
+ 
+   py::enum_<ActivityType>(m, "ProfilerActivity")
+       .value("CPU", ActivityType::CPU)
+-      .value("CUDA", ActivityType::CUDA);
++      .value("CUDA", ActivityType::CUDA)
++      .value("MLU", ActivityType::MLU);
+ 
+   py::class_<ExperimentalConfig>(m, "_ExperimentalConfig")
+       .def(
+diff --git a/torch/profiler/profiler.py b/torch/profiler/profiler.py
+index 78ff771a26..e1105b3d36 100644
+--- a/torch/profiler/profiler.py
++++ b/torch/profiler/profiler.py
+@@ -102,6 +102,7 @@ class _KinetoProfile(object):
+             with_modules=self.with_modules,
+             use_kineto=True,
+             experimental_config=self.experimental_config,
++            use_mlu=(ProfilerActivity.MLU in self.activities),
+         )
+         self.profiler._prepare_trace()
+ 
+@@ -396,7 +397,8 @@ class profile(_KinetoProfile):
+             with_modules: bool = False,
+             experimental_config: Optional[_ExperimentalConfig] = None,
+             # deprecated:
+-            use_cuda: Optional[bool] = None):
++            use_cuda: Optional[bool] = None,
++            use_mlu: Optional[bool] = None):
+ 
+         activities_set = set(activities) if activities else supported_activities()
+         if use_cuda is not None:
+@@ -407,6 +409,14 @@ class profile(_KinetoProfile):
+                 activities_set.remove(ProfilerActivity.CUDA)
+         assert len(activities_set) > 0, "No valid profiler activities found"
+ 
++        if use_mlu is not None:
++            warn("use_mlu is deprecated, use activities argument instead")
++            if use_mlu:
++                activities_set.add(ProfilerActivity.MLU)
++            elif ProfilerActivity.MLU in activities_set:
++                activities_set.remove(ProfilerActivity.MLU)
++        assert len(activities_set) > 0, "No valid profiler activities found"
++
+         super().__init__(
+             activities=activities,
+             record_shapes=record_shapes,

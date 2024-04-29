@@ -1,0 +1,748 @@
+diff --git a/aten/src/ATen/autocast_mode.cpp b/aten/src/ATen/autocast_mode.cpp
+index 1247cf31a4..9ade118bf4 100644
+--- a/aten/src/ATen/autocast_mode.cpp
++++ b/aten/src/ATen/autocast_mode.cpp
+@@ -1,10 +1,5 @@
+-#include <ATen/ATen.h>
+-#include <torch/library.h>
+-#include <ATen/NativeFunctions.h>
+ #include <ATen/autocast_mode.h>
+ 
+-#include <c10/util/intrusive_ptr.h>
+-#include <c10/core/impl/LocalDispatchKeySet.h>
+ 
+ #include <iostream>
+ #include <exception>
+@@ -36,6 +31,14 @@ void set_xpu_enabled(bool new_enabled) {
+   c10::impl::tls_set_dispatch_key_excluded(DispatchKey::AutocastXPU, !new_enabled);
+ }
+ 
++bool is_mlu_enabled() {
++  return !c10::impl::tls_is_dispatch_key_excluded(DispatchKey::AutocastMLU);
++}
++
++void set_mlu_enabled(bool new_enabled) {
++  c10::impl::tls_set_dispatch_key_excluded(DispatchKey::AutocastMLU, !new_enabled);
++}
++
+ namespace {
+ // Imitate Apex and cache some of the casts to streamline parameter reuse.
+ // Our heuristic is to cache lower_precision_fp casts of fp32 model weights (see cached_cast below).
+@@ -69,6 +72,9 @@ thread_local at::ScalarType autocast_cpu_dtype = at::kBFloat16;
+ // autocast_xpu_dtype is the lower_precision_fp used by AutocastXPU.
+ thread_local at::ScalarType autocast_xpu_dtype = at::kBFloat16;
+ 
++// autocast_mlu_dtype is the lower_precision_fp used by AutocastMLU.
++thread_local at::ScalarType autocast_mlu_dtype = at::kHalf;
++
+ // should we enabled the cache inside autocast.
+ thread_local bool cache_enabled = true;
+ 
+@@ -100,6 +106,10 @@ at::ScalarType get_autocast_xpu_dtype() {
+   return autocast_xpu_dtype;
+ }
+ 
++at::ScalarType get_autocast_mlu_dtype() {
++  return autocast_mlu_dtype;
++}
++
+ void set_autocast_cpu_dtype(at::ScalarType dtype) {
+   TORCH_CHECK(
+       dtype == at::kBFloat16,
+@@ -115,6 +125,10 @@ void set_autocast_xpu_dtype(at::ScalarType dtype) {
+   autocast_xpu_dtype = dtype;
+ }
+ 
++void set_autocast_mlu_dtype(at::ScalarType dtype) {
++  autocast_mlu_dtype = dtype;
++}
++
+ bool is_autocast_cache_enabled() {
+   return cache_enabled;
+ }
+@@ -151,119 +165,11 @@ Tensor cached_cast(at::ScalarType to_type, const Tensor& arg, DeviceType device_
+   }
+ }
+ 
+-// Policies correspond to op categories that need code-divergent handling.
+-// Wrapper templates below are specialized based on a policy template parameter.
+-enum class CastPolicy : uint8_t {
+-  lower_precision_fp = 0, // Cast all inputs to lower_precision_fp before running the op.
+-                          // Currently, lower_precision_fp is fp16 for AutocastCUDA, and is defined by user(default bf16) for AutocastCPU.
+-  fp32, // Cast all inputs to at::kFloat before running the op.
+-  fp32_set_opt_dtype, // Treats functions (like softmax) that
+-                      //   1. we'd like to run in fp32 and
+-                      //   2. have a c10::optional<ScalarType> arg that controls the output type.
+-                      // fp32_set_opt_dtype wrappers' policy is:  if the output type is already set,
+-                      // don't touch it, otherwise, set it to at::kFloat.
+-  fp32_append_dtype, // Treats functions (like norm) that
+-                     //   1. we'd like to run in fp32 and
+-                     //   2. have some overloads that accept an output type and other overloads that don't.
+-                     // fp32_append_dtype wrappers wrap the overloads that don't have an output dtype.
+-                     // The wrapper policy is:  append at::kFloat to the args, and redispatch to the
+-                     // type-aware overload.
+-  promote, // Run in the widest dtype among several args.
+-};
+-
+-/********************************************************************************************************
+-Templates to provide wrapper functions
+-
+-I'm copying the pattern used in core/boxing/impl/WrapFunctionIntoFunctor.h to extract args and return type.
+-(see also https://stackoverflow.com/questions/46533698/how-to-deduce-argument-list-from-function-pointer)
+-
+-This strategy uses an exterior "WrapFunction" that extracts arguments on behalf of
+-(in my case several specializations of) an interior "WrapFunction_".
+-Interior WrapFunction_ specializations are defined for each CastPolicy.
+-********************************************************************************************************/
+-
+-// Base template for WrapFunction_, which is specialized to contain a "call" method each CastPolicy
+-template<CastPolicy policy, DeviceType device_type, class Redispatch, Redispatch* F, class Ret, class ArgList> struct WrapFunction_ {};
+-
+-// CastPolicy::lower_precision_fp General_DeviceType
+-template<DeviceType device_type, class Redispatch, Redispatch* F, class Ret, class... Args>
+-struct WrapFunction_<CastPolicy::lower_precision_fp, device_type, Redispatch, F, Ret, guts::typelist::typelist<Args...>> {
+-  static Ret call(Args... args) {
+-    c10::impl::ExcludeDispatchKeyGuard no_autocast(get_autocast_dispatch_key_from_device_type(device_type));
+-    return (*F)(cached_cast(get_lower_precision_fp_from_device_type(device_type), args, device_type)...);
+-  }
+-};
+-
+-// CastPolicy::fp32 General_DeviceType
+-template<DeviceType device_type, class Redispatch, Redispatch* F, class Ret, class... Args>
+-struct WrapFunction_<CastPolicy::fp32, device_type, Redispatch, F, Ret, guts::typelist::typelist<Args...>> {
+-  static Ret call(Args... args) {
+-    c10::impl::ExcludeDispatchKeyGuard no_autocast(get_autocast_dispatch_key_from_device_type(device_type));
+-    return (*F)(cached_cast(at::kFloat, args, device_type)...);
+-  }
+-};
+-
+-// CastPolicy::fp32_set_opt_dtype DeviceType::CUDA
+-template<class Redispatch, Redispatch* F, class Ret, class... Args>
+-struct WrapFunction_<CastPolicy::fp32_set_opt_dtype, DeviceType::CUDA, Redispatch, F, Ret, guts::typelist::typelist<Args...>> {
+-  static Ret call(Args... args) {
+-    c10::impl::ExcludeDispatchKeyGuard no_autocast(DispatchKey::Autocast);
+-    if (firstarg_is_eligible(args...)) {
+-      return (*F)(set_opt_dtype(at::kFloat, args)...);
+-    } else {
+-      // If ineligible, calls F with unaltered args.  Does not set opt dtype, because setting
+-      // opt dtype explicitly may interfere with internal implicit promotion decisions.
+-      return (*F)(args...);
+-    }
+-  }
+-};
+-
+-// CastPolicy::fp32_append_dtype DeviceType::CUDA
+-template<class Redispatch, Redispatch* F, class Ret, class... Args>
+-struct WrapFunction_<CastPolicy::fp32_append_dtype, DeviceType::CUDA, Redispatch, F, Ret, guts::typelist::typelist<Args...>> {
+-  static Ret call(Args... args) {
+-    c10::impl::ExcludeDispatchKeyGuard no_autocast(DispatchKey::Autocast);
+-    at::ScalarType out_type = type_from_firstarg(at::kFloat, args...);
+-    return (*F)(args..., out_type);
+-  }
+-};
+-
+-// CastPolicy::promote General_DeviceType
+-template<DeviceType device_type, class Redispatch, Redispatch* F, class Ret, class... Args>
+-struct WrapFunction_<CastPolicy::promote, device_type, Redispatch, F, Ret, guts::typelist::typelist<Args...>> {
+-  static Ret call(Args... args) {
+-    c10::impl::ExcludeDispatchKeyGuard no_autocast(get_autocast_dispatch_key_from_device_type(device_type));
+-    auto to_type = promote_type(get_lower_precision_fp_from_device_type(device_type), device_type, args...);
+-    return (*F)(cached_cast(to_type, args, device_type)...);
+-  }
+-};
+-
+-// Wrapper to infer return_type and parameter_types for WrapFunction_ (imitating core/boxing/impl/WrapFunctionIntoFunctor.h)
+-template<CastPolicy policy,
+-         DeviceType device_type,
+-         class Registered, // The signature for which we're registering.  The dispatcher's calling code invokes our
+-                           // registered functions with arguments matching Registered, so we register
+-                           // WrapFunction_::call methods with a matching signature to properly field those arguments.
+-                           // guts::function_traits below extracts return_type and parameter_types from Registered,
+-                           // which WrapFunction_ templates above use to declare their call methods.
+-         class Redispatch, // The signature for the function we're redispatching to.  In most cases this is the same
+-                           // as Registered, but for some ops (for example, ops where we append a dtype) it's useful
+-                           // to redispatch to a function with a different signature.
+-         Redispatch* F>    // The actual function we're redispatching to.
+-struct WrapFunction final {
+-  using type = WrapFunction_<policy,
+-                             device_type,
+-                             Redispatch,
+-                             F,
+-                             typename guts::function_traits<Registered>::return_type,
+-                             typename guts::function_traits<Registered>::parameter_types>;
+-};
+-
+ /*******************************
+ Banned functions
+ *******************************/
+ 
+-Tensor binary_cross_entropy_banned(const Tensor &, const Tensor &, const c10::optional<Tensor>&, int64_t) {
++static Tensor binary_cross_entropy_banned(const Tensor &, const Tensor &, const c10::optional<Tensor>&, int64_t) {
+   AT_ERROR("torch.nn.functional.binary_cross_entropy and torch.nn.BCELoss are unsafe to autocast.\n"
+            "Many models use a sigmoid layer right before the binary cross entropy layer.\n"
+            "In this case, combine the two layers using torch.nn.functional.binary_cross_entropy_with_logits\n"
+@@ -272,60 +178,15 @@ Tensor binary_cross_entropy_banned(const Tensor &, const Tensor &, const c10::op
+ }
+ 
+ namespace {
+-/*****************************************************************************************************************
+-This section performs load-time registration for autocast wrappers.
+-
+-It's debatable at what level operations should be patched.  We'd like casts to be autograd-exposed
+-and precede autograd history recording, so that for lower_precision_fp ops, input tensors are saved for backward
+-in lower_precision_fp rather than fp32.  Saving inputs in lower_precision_fp can significantly reduce
+-a model's memory footprint.
+-
+-Option 1 (strawman):  Patch only at the level of explicit calls into cudnn/cublas (cudnn_convolution, etc),
+-because those are the code paths that are guaranteed to use Tensor Cores, therefore they're the ones that
+-will benefit most from lower_precision_fp.   Potential pitfall:  convolutions (and other ops) are wrapped in several
+-layers of at::* calls.  If one of those happens to record autograd history, then we've lost the
+-opportunity to save inputs in lower_precision_fp.
+-
+-Option 2:  Patch the Python-exposed surface of calls, to make 100% sure autograd history
+-recording can't sneak in ahead of autocast.  This mirrors Apex most closely.
+-
+-I think Option 2 is the right answer for all ops, not just convolutions.  Option 2 is what I implement here.
+-*****************************************************************************************************************/
+-
+-/********************************************************************************************************************
+-Explicit registration for out-of-place ops
+-
+-The stuff below could be codegenned.  Ed said
+-> you are going to have to write the function definition at some point, I wouldn't try to get clever about it
+-Therefore, for the moment, this is all copy pasted in from VariableTypeEverything.cpp with appropriate substitutions.
+-********************************************************************************************************************/
+-
+-#define ADD_NS(RAW_OP) at::RAW_OP
+-
+-// Common cases where registration signature matches redispatch signature
+-// (that's why SIGNATURE is repeated in the WrapFunction instantiation)
+-#define KERNEL(FUNC, REGISTER_NAME, SIGNATURE, POLICY) \
+-  m.impl(TORCH_SELECTIVE_NAME("aten::" REGISTER_NAME), \
+-    &WrapFunction<CastPolicy::POLICY, DeviceType::CUDA, SIGNATURE, SIGNATURE, &FUNC>::type::call);
+-
+-// Less-common but still useful case: redispatching to a function with a new signature (e.g. appending a dtype)
+-#define KERNEL_DIFFERENT_REDISPATCH_SIGNATURE(REDISPATCH_FUNC, REGISTER_NAME, REGISTER_SIGNATURE, REDISPATCH_SIGNATURE, POLICY) \
+-  m.impl(TORCH_SELECTIVE_NAME("aten::" REGISTER_NAME), \
+-    &WrapFunction<CastPolicy::POLICY, DeviceType::CUDA, REGISTER_SIGNATURE, REDISPATCH_SIGNATURE, &REDISPATCH_FUNC>::type::call);
+-
+-// KERNEL_CPU registration for AutocastCPU
+-#define KERNEL_CPU(FUNC, REGISTER_NAME, SIGNATURE, POLICY) \
+-  m.impl(TORCH_SELECTIVE_NAME("aten::" REGISTER_NAME), \
+-    &WrapFunction<CastPolicy::POLICY, DeviceType::CPU, SIGNATURE, SIGNATURE, &FUNC>::type::call);
+ 
+ /*****************************************
+ Explicit registration for out-of-place ops
+ *****************************************/
+-TORCH_LIBRARY_IMPL(_, Autocast, m) {
++TORCH_LIBRARY_IMPL(_, AutocastCUDA, m) {
+   m.fallback(torch::CppFunction::makeFallthrough());
+ }
+ 
+-TORCH_LIBRARY_IMPL(aten, Autocast, m) {
++TORCH_LIBRARY_IMPL(aten, AutocastCUDA, m) {
+   // lower_precision_fp
+   KERNEL(ADD_NS(_convolution), "_convolution.deprecated", Tensor (const Tensor &, const Tensor &, const c10::optional<Tensor>&, IntArrayRef, IntArrayRef, IntArrayRef, bool, IntArrayRef, int64_t, bool, bool, bool), lower_precision_fp)
+   KERNEL(ADD_NS(_convolution), "_convolution", Tensor (const Tensor &, const Tensor &, const c10::optional<Tensor>&, IntArrayRef, IntArrayRef, IntArrayRef, bool, IntArrayRef, int64_t, bool, bool, bool, bool), lower_precision_fp)
+@@ -705,6 +566,8 @@ TORCH_LIBRARY_IMPL(aten, AutocastCPU, m) {
+   KERNEL_CPU(ADD_NS(index_copy), "index_copy.dimname", Tensor (const Tensor &, at::Dimname, const Tensor &, const Tensor &), promote)
+ 
+ }
++
++
+ } // namespace
+ } // namespace autocast
+ } // namespace at
+diff --git a/aten/src/ATen/autocast_mode.h b/aten/src/ATen/autocast_mode.h
+index f5e88a0b88..6fdd6fc6c7 100644
+--- a/aten/src/ATen/autocast_mode.h
++++ b/aten/src/ATen/autocast_mode.h
+@@ -1,6 +1,11 @@
+ #pragma once
+ 
+ #include <ATen/ATen.h>
++#include <ATen/NativeFunctions.h>
++#include <torch/library.h>
++
++#include <c10/core/impl/LocalDispatchKeySet.h>
++#include <c10/util/intrusive_ptr.h>
+ 
+ namespace at {
+ namespace autocast {
+@@ -20,6 +25,10 @@ TORCH_API bool is_xpu_enabled();
+ TORCH_API void set_xpu_enabled(bool enabled);
+ TORCH_API at::ScalarType get_autocast_xpu_dtype();
+ TORCH_API void set_autocast_xpu_dtype(at::ScalarType dtype);
++TORCH_API bool is_mlu_enabled();
++TORCH_API void set_mlu_enabled(bool enabled);
++TORCH_API at::ScalarType get_autocast_mlu_dtype();
++TORCH_API void set_autocast_mlu_dtype(at::ScalarType dtype);
+ TORCH_API bool is_autocast_cache_enabled();
+ TORCH_API void set_autocast_cache_enabled(bool enabled);
+ 
+@@ -34,6 +43,8 @@ bool is_autocast_eligible(const Tensor& tensor, DeviceType device_type) {
+           tensor.is_floating_point();
+     case DeviceType::XPU:
+       return tensor.is_xpu() && tensor.is_floating_point();
++    case DeviceType::MLU:
++      return tensor.is_mlu() && tensor.is_floating_point();
+     default:
+       return false;
+   }
+@@ -44,11 +55,13 @@ inline DispatchKey get_autocast_dispatch_key_from_device_type(
+     DeviceType device_type) {
+   switch (device_type) {
+     case DeviceType::CUDA:
+-      return DispatchKey::Autocast;
++      return DispatchKey::AutocastCUDA;
+     case DeviceType::CPU:
+       return DispatchKey::AutocastCPU;
+     case DeviceType::XPU:
+       return DispatchKey::AutocastXPU;
++    case DeviceType::MLU:
++      return DispatchKey::AutocastMLU;
+     default:
+       throw std::runtime_error(
+           "unknown device type for autocast in get_autocast_dispatch_key_from_device_type");
+@@ -64,6 +77,8 @@ inline at::ScalarType get_lower_precision_fp_from_device_type(
+       return get_autocast_cpu_dtype();
+     case DeviceType::XPU:
+       return get_autocast_xpu_dtype();
++    case DeviceType::MLU:
++      return get_autocast_mlu_dtype();
+     default:
+       throw std::runtime_error(
+           "unknown device type for autocast in get_lower_precision_fp_from_device_type");
+@@ -223,6 +238,11 @@ inline bool firstarg_is_eligible(const Tensor& arg, Args... args) {
+   return is_eligible(arg);
+ }
+ 
++template <typename... Args>
++inline bool firstarg_is_eligible(c10::DeviceType device_type, const Tensor& arg, Args... args) {
++  return is_eligible(arg, device_type);
++}
++
+ template <typename... Args>
+ inline at::ScalarType type_from_firstarg(
+     at::ScalarType to_type,
+@@ -231,5 +251,178 @@ inline at::ScalarType type_from_firstarg(
+   return (is_eligible(arg) ? to_type : arg.scalar_type());
+ }
+ 
++template <typename... Args>
++inline at::ScalarType type_from_firstarg(
++    c10::DeviceType device_type,
++    at::ScalarType to_type,
++    const Tensor& arg,
++    Args... args) {
++  return (is_eligible(arg, device_type) ? to_type : arg.scalar_type());
++}
++
++// Policies correspond to op categories that need code-divergent handling.
++// Wrapper templates below are specialized based on a policy template parameter.
++enum class CastPolicy : uint8_t {
++  lower_precision_fp = 0, // Cast all inputs to lower_precision_fp before running the op.
++                          // Currently, lower_precision_fp is fp16 for AutocastCUDA, and is defined by user(default bf16) for AutocastCPU.
++  fp32, // Cast all inputs to at::kFloat before running the op.
++  fp32_set_opt_dtype, // Treats functions (like softmax) that
++                      //   1. we'd like to run in fp32 and
++                      //   2. have a c10::optional<ScalarType> arg that controls the output type.
++                      // fp32_set_opt_dtype wrappers' policy is:  if the output type is already set,
++                      // don't touch it, otherwise, set it to at::kFloat.
++  fp32_append_dtype, // Treats functions (like norm) that
++                     //   1. we'd like to run in fp32 and
++                     //   2. have some overloads that accept an output type and other overloads that don't.
++                     // fp32_append_dtype wrappers wrap the overloads that don't have an output dtype.
++                     // The wrapper policy is:  append at::kFloat to the args, and redispatch to the
++                     // type-aware overload.
++  promote, // Run in the widest dtype among several args.
++};
++
++/********************************************************************************************************
++Templates to provide wrapper functions
++
++I'm copying the pattern used in core/boxing/impl/WrapFunctionIntoFunctor.h to extract args and return type.
++(see also https://stackoverflow.com/questions/46533698/how-to-deduce-argument-list-from-function-pointer)
++
++This strategy uses an exterior "WrapFunction" that extracts arguments on behalf of
++(in my case several specializations of) an interior "WrapFunction_".
++Interior WrapFunction_ specializations are defined for each CastPolicy.
++********************************************************************************************************/
++
++// Base template for WrapFunction_, which is specialized to contain a "call" method each CastPolicy
++template<CastPolicy policy, DeviceType device_type, class Redispatch, Redispatch* F, class Ret, class ArgList> struct WrapFunction_ {};
++
++// CastPolicy::lower_precision_fp General_DeviceType
++template<DeviceType device_type, class Redispatch, Redispatch* F, class Ret, class... Args>
++struct WrapFunction_<CastPolicy::lower_precision_fp, device_type, Redispatch, F, Ret, guts::typelist::typelist<Args...>> {
++  static Ret call(Args... args) {
++    c10::impl::ExcludeDispatchKeyGuard no_autocast(get_autocast_dispatch_key_from_device_type(device_type));
++    return (*F)(cached_cast(get_lower_precision_fp_from_device_type(device_type), args, device_type)...);
++  }
++};
++
++// CastPolicy::fp32 General_DeviceType
++template<DeviceType device_type, class Redispatch, Redispatch* F, class Ret, class... Args>
++struct WrapFunction_<CastPolicy::fp32, device_type, Redispatch, F, Ret, guts::typelist::typelist<Args...>> {
++  static Ret call(Args... args) {
++    c10::impl::ExcludeDispatchKeyGuard no_autocast(get_autocast_dispatch_key_from_device_type(device_type));
++    return (*F)(cached_cast(at::kFloat, args, device_type)...);
++  }
++};
++
++// CastPolicy::fp32_set_opt_dtype General_DeviceType
++template<DeviceType device_type, class Redispatch, Redispatch* F, class Ret, class... Args>
++struct WrapFunction_<CastPolicy::fp32_set_opt_dtype, device_type, Redispatch, F, Ret, guts::typelist::typelist<Args...>> {
++  static Ret call(Args... args) {
++    c10::impl::ExcludeDispatchKeyGuard no_autocast(get_autocast_dispatch_key_from_device_type(device_type));
++    if (firstarg_is_eligible(device_type, args...)) {
++      return (*F)(set_opt_dtype(at::kFloat, args)...);
++    } else {
++      // If ineligible, calls F with unaltered args.  Does not set opt dtype, because setting
++      // opt dtype explicitly may interfere with internal implicit promotion decisions.
++      return (*F)(args...);
++    }
++  }
++};
++
++// CastPolicy::fp32_append_dtype General_DeviceType
++template<DeviceType device_type, class Redispatch, Redispatch* F, class Ret, class... Args>
++struct WrapFunction_<CastPolicy::fp32_append_dtype, device_type, Redispatch, F, Ret, guts::typelist::typelist<Args...>> {
++  static Ret call(Args... args) {
++    c10::impl::ExcludeDispatchKeyGuard no_autocast(get_autocast_dispatch_key_from_device_type(device_type));
++    at::ScalarType out_type = type_from_firstarg(device_type, at::kFloat, args...);
++    return (*F)(args..., out_type);
++  }
++};
++
++// CastPolicy::promote General_DeviceType
++template<DeviceType device_type, class Redispatch, Redispatch* F, class Ret, class... Args>
++struct WrapFunction_<CastPolicy::promote, device_type, Redispatch, F, Ret, guts::typelist::typelist<Args...>> {
++  static Ret call(Args... args) {
++    c10::impl::ExcludeDispatchKeyGuard no_autocast(get_autocast_dispatch_key_from_device_type(device_type));
++    auto to_type = promote_type(get_lower_precision_fp_from_device_type(device_type), device_type, args...);
++    return (*F)(cached_cast(to_type, args, device_type)...);
++  }
++};
++
++// Wrapper to infer return_type and parameter_types for WrapFunction_ (imitating core/boxing/impl/WrapFunctionIntoFunctor.h)
++template<CastPolicy policy,
++         DeviceType device_type,
++         class Registered, // The signature for which we're registering.  The dispatcher's calling code invokes our
++                           // registered functions with arguments matching Registered, so we register
++                           // WrapFunction_::call methods with a matching signature to properly field those arguments.
++                           // guts::function_traits below extracts return_type and parameter_types from Registered,
++                           // which WrapFunction_ templates above use to declare their call methods.
++         class Redispatch, // The signature for the function we're redispatching to.  In most cases this is the same
++                           // as Registered, but for some ops (for example, ops where we append a dtype) it's useful
++                           // to redispatch to a function with a different signature.
++         Redispatch* F>    // The actual function we're redispatching to.
++struct WrapFunction final {
++  using type = WrapFunction_<policy,
++                             device_type,
++                             Redispatch,
++                             F,
++                             typename guts::function_traits<Registered>::return_type,
++                             typename guts::function_traits<Registered>::parameter_types>;
++};
++
++/*****************************************************************************************************************
++This section performs load-time registration for autocast wrappers.
++
++It's debatable at what level operations should be patched.  We'd like casts to be autograd-exposed
++and precede autograd history recording, so that for lower_precision_fp ops, input tensors are saved for backward
++in lower_precision_fp rather than fp32.  Saving inputs in lower_precision_fp can significantly reduce
++a model's memory footprint.
++
++Option 1 (strawman):  Patch only at the level of explicit calls into cudnn/cublas (cudnn_convolution, etc),
++because those are the code paths that are guaranteed to use Tensor Cores, therefore they're the ones that
++will benefit most from lower_precision_fp.   Potential pitfall:  convolutions (and other ops) are wrapped in several
++layers of at::* calls.  If one of those happens to record autograd history, then we've lost the
++opportunity to save inputs in lower_precision_fp.
++
++Option 2:  Patch the Python-exposed surface of calls, to make 100% sure autograd history
++recording can't sneak in ahead of autocast.  This mirrors Apex most closely.
++
++I think Option 2 is the right answer for all ops, not just convolutions.  Option 2 is what I implement here.
++*****************************************************************************************************************/
++
++/********************************************************************************************************************
++Explicit registration for out-of-place ops
++
++The stuff below could be codegenned.  Ed said
++> you are going to have to write the function definition at some point, I wouldn't try to get clever about it
++Therefore, for the moment, this is all copy pasted in from VariableTypeEverything.cpp with appropriate substitutions.
++********************************************************************************************************************/
++
++#define ADD_NS(RAW_OP) at::RAW_OP
++
++// Common cases where registration signature matches redispatch signature
++// (that's why SIGNATURE is repeated in the WrapFunction instantiation)
++#define KERNEL(FUNC, REGISTER_NAME, SIGNATURE, POLICY) \
++  m.impl(TORCH_SELECTIVE_NAME("aten::" REGISTER_NAME), \
++    &WrapFunction<CastPolicy::POLICY, c10::DeviceType::CUDA, SIGNATURE, SIGNATURE, &FUNC>::type::call);
++
++// Less-common but still useful case: redispatching to a function with a new signature (e.g. appending a dtype)
++#define KERNEL_DIFFERENT_REDISPATCH_SIGNATURE(REDISPATCH_FUNC, REGISTER_NAME, REGISTER_SIGNATURE, REDISPATCH_SIGNATURE, POLICY) \
++  m.impl(TORCH_SELECTIVE_NAME("aten::" REGISTER_NAME), \
++    &WrapFunction<CastPolicy::POLICY, c10::DeviceType::CUDA, REGISTER_SIGNATURE, REDISPATCH_SIGNATURE, &REDISPATCH_FUNC>::type::call);
++
++// Less-common but still useful case: redispatching to a function with a new signature (e.g. appending a dtype)
++#define KERNEL_MLU_DIFFERENT_REDISPATCH_SIGNATURE(REDISPATCH_FUNC, REGISTER_NAME, REGISTER_SIGNATURE, REDISPATCH_SIGNATURE, POLICY) \
++  m.impl(TORCH_SELECTIVE_NAME("aten::" REGISTER_NAME), \
++    &WrapFunction<CastPolicy::POLICY, c10::DeviceType::MLU, REGISTER_SIGNATURE, REDISPATCH_SIGNATURE, &REDISPATCH_FUNC>::type::call);
++
++// KERNEL_CPU registration for AutocastCPU
++#define KERNEL_CPU(FUNC, REGISTER_NAME, SIGNATURE, POLICY) \
++  m.impl(TORCH_SELECTIVE_NAME("aten::" REGISTER_NAME), \
++    &WrapFunction<CastPolicy::POLICY, c10::DeviceType::CPU, SIGNATURE, SIGNATURE, &FUNC>::type::call);
++
++// KERNEL_MLU registration for AutocastMLU
++#define KERNEL_MLU(FUNC, REGISTER_NAME, SIGNATURE, POLICY) \
++  m.impl(TORCH_SELECTIVE_NAME("aten::" REGISTER_NAME), \
++    &WrapFunction<CastPolicy::POLICY, c10::DeviceType::MLU, SIGNATURE, SIGNATURE, &FUNC>::type::call);
++
+ } // namespace autocast
+ } // namespace at
+diff --git a/aten/src/ATen/core/interned_strings.h b/aten/src/ATen/core/interned_strings.h
+index dc5860ebf2..d34cc11630 100644
+--- a/aten/src/ATen/core/interned_strings.h
++++ b/aten/src/ATen/core/interned_strings.h
+@@ -224,6 +224,7 @@ namespace c10 {
+   _(aten, has_torch_function)        \
+   _(aten, is_autocast_enabled)       \
+   _(aten, is_autocast_cpu_enabled)   \
++  _(aten, is_autocast_mlu_enabled)   \
+   FORALL_ATEN_BASE_SYMBOLS(_)        \
+   _(onnx, Add)                       \
+   _(onnx, Concat)                    \
+diff --git a/aten/src/ATen/cudnn/AutocastRNN.cpp b/aten/src/ATen/cudnn/AutocastRNN.cpp
+index 083d435975..46fef0914d 100644
+--- a/aten/src/ATen/cudnn/AutocastRNN.cpp
++++ b/aten/src/ATen/cudnn/AutocastRNN.cpp
+@@ -36,7 +36,7 @@ _cudnn_rnn_cast_reflatten(const Tensor & input,
+                           IntArrayRef batch_sizes,
+                           const c10::optional<Tensor>& dropout_state) {
+ #if AT_CUDNN_ENABLED()
+-  c10::impl::ExcludeDispatchKeyGuard no_autocast(DispatchKey::Autocast);
++  c10::impl::ExcludeDispatchKeyGuard no_autocast(DispatchKey::AutocastCUDA);
+ 
+   for (const auto& t : weight) {
+     TORCH_CHECK(weight[0].scalar_type() == t.scalar_type(), "Weight scalar types do not match.");
+@@ -119,7 +119,7 @@ _cudnn_rnn_cast_reflatten(const Tensor & input,
+ }
+ 
+ namespace {
+-TORCH_LIBRARY_IMPL(aten, Autocast, m) {
++TORCH_LIBRARY_IMPL(aten, AutocastCUDA, m) {
+   m.impl("_cudnn_rnn",
+          TORCH_FN((&at::autocast::_cudnn_rnn_cast_reflatten)));
+ }
+diff --git a/c10/core/DispatchKey.cpp b/c10/core/DispatchKey.cpp
+index 709b07b403..b923d66076 100644
+--- a/c10/core/DispatchKey.cpp
++++ b/c10/core/DispatchKey.cpp
+@@ -140,6 +140,8 @@ const char* toString(DispatchKey t) {
+       return "AutocastXPU";
+     case DispatchKey::AutocastCUDA:
+       return "AutocastCUDA";
++    case DispatchKey::AutocastMLU:
++      return "AutocastMLU";
+ 
+     case DispatchKey::FuncTorchBatched:
+       return "FuncTorchBatched";
+@@ -278,6 +280,7 @@ c10::DispatchKey parseDispatchKey(const std::string& k) {
+       {"AutocastCPU", c10::DispatchKey::AutocastCPU},
+       {"AutocastXPU", c10::DispatchKey::AutocastXPU},
+       {"AutocastCUDA", c10::DispatchKey::AutocastCUDA},
++      {"AutocastMLU", c10::DispatchKey::AutocastMLU},
+       {"FuncTorchBatched", c10::DispatchKey::FuncTorchBatched},
+       {"FuncTorchVmapMode", c10::DispatchKey::FuncTorchVmapMode},
+       {"Batched", c10::DispatchKey::Batched},
+diff --git a/c10/core/DispatchKey.h b/c10/core/DispatchKey.h
+index 62864c9074..7ca8e7ec1b 100644
+--- a/c10/core/DispatchKey.h
++++ b/c10/core/DispatchKey.h
+@@ -351,6 +351,7 @@ enum class DispatchKey : uint16_t {
+   // and inputs are saved for backward in the post-autocast type.
+   AutocastCPU,
+   AutocastXPU,
++  AutocastMLU,
+   // Naughtily, AutocastCUDA is also being used for XLA.  In the terminal state,
+   // it probably should get its own Autocast key
+   AutocastCUDA,
+@@ -466,7 +467,7 @@ enum class DispatchKey : uint16_t {
+   PrivateUse1_PreAutograd = AutogradPrivateUse1,
+   PrivateUse2_PreAutograd = AutogradPrivateUse2,
+   PrivateUse3_PreAutograd = AutogradPrivateUse3,
+-  Autocast = AutocastCUDA,
++  Autocast = AutocastMLU,
+ };
+ 
+ // Note [Private use DispatchKey]
+diff --git a/torch/amp/autocast_mode.py b/torch/amp/autocast_mode.py
+index fd6ce5e769..f35072265d 100644
+--- a/torch/amp/autocast_mode.py
++++ b/torch/amp/autocast_mode.py
+@@ -195,6 +195,8 @@ class autocast(object):
+             self.fast_dtype = torch.get_autocast_cpu_dtype()
+         elif self.device == 'xpu':
+             self.fast_dtype = torch.xpu.get_autocast_xpu_dtype()  # type: ignore[attr-defined]
++        elif self.device == 'mlu':
++            self.fast_dtype = torch.get_autocast_mlu_dtype()  # type: ignore[attr-defined]
+         else:
+             raise RuntimeError('User specified autocast device_type must be \'cuda\' or \'cpu\'')
+         self._cache_enabled = torch.is_autocast_cache_enabled()
+@@ -220,6 +222,15 @@ class autocast(object):
+                 error_message += 'XPU Autocast only supports dtype of torch.bfloat16 currently.'
+                 warnings.warn(error_message)
+                 enabled = False
++        if self.device == 'mlu':
++            supported_dtype = [torch.bfloat16, torch.float16]
++            if self.fast_dtype not in supported_dtype:
++                error_message = 'In MLU autocast, but the target dtype is not supported. Disabling autocast.\n'
++                error_message += 'MLU Autocast only supports dtype of torch.float16 and torch.bfloat16 currently.'
++                warnings.warn(error_message)
++                enabled = False
++            if self.fast_dtype == torch.bfloat16 and not torch.mlu.is_bf16_supported():
++                raise RuntimeError('Current MLU Device does not support bfloat16. Please switch dtype to float16.')
+         if self.device == 'cuda':
+             if self.fast_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+                 raise RuntimeError('Current CUDA Device does not support bfloat16. Please switch dtype to float16.')
+@@ -243,6 +254,12 @@ class autocast(object):
+             torch.xpu.set_autocast_xpu_enabled(self._enabled)  # type: ignore[attr-defined]
+             torch.xpu.set_autocast_xpu_dtype(self.fast_dtype)  # type: ignore[attr-defined]
+             torch.autocast_increment_nesting()
++        elif self.device == 'mlu':
++            self.prev = torch.is_autocast_mlu_enabled()    # type: ignore[attr-defined]
++            self.prev_fastdtype = torch.get_autocast_mlu_dtype()  # type: ignore[attr-defined]
++            torch.set_autocast_mlu_enabled(self._enabled)  # type: ignore[attr-defined]
++            torch.set_autocast_mlu_dtype(self.fast_dtype)  # type: ignore[attr-defined]
++            torch.autocast_increment_nesting()
+         else:
+             self.prev = torch.is_autocast_enabled()
+             self.prev_fastdtype = torch.get_autocast_gpu_dtype()
+@@ -266,6 +283,11 @@ class autocast(object):
+                 torch.clear_autocast_cache()
+             torch.xpu.set_autocast_xpu_enabled(self.prev)            # type: ignore[attr-defined]
+             torch.xpu.set_autocast_xpu_dtype(self.prev_fastdtype)    # type: ignore[attr-defined]
++        elif self.device == 'mlu':
++            if torch.autocast_decrement_nesting() == 0:
++                torch.clear_autocast_cache()
++            torch.set_autocast_mlu_enabled(self.prev)            # type: ignore[attr-defined]
++            torch.set_autocast_mlu_dtype(self.prev_fastdtype)    # type: ignore[attr-defined]
+         else:
+             if torch.autocast_decrement_nesting() == 0:
+                 torch.clear_autocast_cache()
+diff --git a/torch/csrc/autograd/init.cpp b/torch/csrc/autograd/init.cpp
+index a1d6de21d1..b08a45e4b8 100644
+--- a/torch/csrc/autograd/init.cpp
++++ b/torch/csrc/autograd/init.cpp
+@@ -462,6 +462,47 @@ static PyObject* get_autocast_cpu_dtype(PyObject* _unused, PyObject* arg) {
+   END_HANDLE_TH_ERRORS
+ }
+ 
++static PyObject* set_autocast_mlu_enabled(PyObject* _unused, PyObject* arg) {
++  HANDLE_TH_ERRORS
++  if (!PyBool_Check(arg)) {
++    throw TypeError("enabled must be a bool (got %s)", Py_TYPE(arg)->tp_name);
++  }
++  at::autocast::set_mlu_enabled(arg == Py_True);
++  Py_RETURN_NONE;
++  END_HANDLE_TH_ERRORS
++}
++
++static PyObject* is_autocast_mlu_enabled(PyObject* _unused, PyObject* arg) {
++  HANDLE_TH_ERRORS
++  if (at::autocast::is_mlu_enabled()) {
++    Py_RETURN_TRUE;
++  } else {
++    Py_RETURN_FALSE;
++  }
++  END_HANDLE_TH_ERRORS
++}
++
++static PyObject* set_autocast_mlu_dtype(PyObject* _unused, PyObject* arg) {
++  HANDLE_TH_ERRORS
++  if (!THPDtype_Check(arg)) {
++    throw TypeError(
++        "dtype must be a torch.dtype (got %s)", Py_TYPE(arg)->tp_name);
++  }
++  at::ScalarType targetType = reinterpret_cast<THPDtype*>(arg)->scalar_type;
++  at::autocast::set_autocast_mlu_dtype(targetType);
++  Py_RETURN_NONE;
++  END_HANDLE_TH_ERRORS
++}
++
++static PyObject* get_autocast_mlu_dtype(PyObject* _unused, PyObject* arg) {
++  HANDLE_TH_ERRORS
++  at::ScalarType current_dtype = at::autocast::get_autocast_mlu_dtype();
++  auto dtype = (PyObject*)torch::getTHPDtype(current_dtype);
++  Py_INCREF(dtype);
++  return dtype;
++  END_HANDLE_TH_ERRORS
++}
++
+ static PyObject* clear_autocast_cache(PyObject* _unused, PyObject* arg) {
+   HANDLE_TH_ERRORS
+   at::autocast::clear_cache();
+@@ -751,6 +792,10 @@ static PyMethodDef methods[] = { // NOLINT
+     {"get_autocast_cpu_dtype", get_autocast_cpu_dtype, METH_NOARGS, nullptr},
+     {"set_autocast_gpu_dtype", set_autocast_gpu_dtype, METH_O, nullptr},
+     {"get_autocast_gpu_dtype", get_autocast_gpu_dtype, METH_NOARGS, nullptr},
++    {"set_autocast_mlu_enabled", set_autocast_mlu_enabled, METH_O, nullptr},
++    {"is_autocast_mlu_enabled", is_autocast_mlu_enabled, METH_NOARGS, nullptr},
++    {"set_autocast_mlu_dtype", set_autocast_mlu_dtype, METH_O, nullptr},
++    {"get_autocast_mlu_dtype", get_autocast_mlu_dtype, METH_NOARGS, nullptr},
+     {"autocast_increment_nesting",
+      autocast_increment_nesting,
+      METH_NOARGS,
+diff --git a/torch/csrc/autograd/python_variable.cpp b/torch/csrc/autograd/python_variable.cpp
+index ba343b6556..2dcb356761 100644
+--- a/torch/csrc/autograd/python_variable.cpp
++++ b/torch/csrc/autograd/python_variable.cpp
+@@ -1568,7 +1568,7 @@ static struct PyGetSetDef THPVariable_properties[] = {
+     {"name", (getter)THPVariable_get_name, nullptr, nullptr, nullptr},
+     {"shape", (getter)THPVariable_get_shape, nullptr, nullptr, nullptr},
+     {"is_cuda", (getter)THPVariable_is_cuda, nullptr, nullptr, nullptr},
+-    {"is_mlu", (getter)THPVariable_is_cuda, nullptr, nullptr, nullptr},
++    {"is_mlu", (getter)THPVariable_is_mlu, nullptr, nullptr, nullptr},
+     {"is_cpu", (getter)THPVariable_is_cpu, nullptr, nullptr, nullptr},
+     {"is_xpu", (getter)THPVariable_is_xpu, nullptr, nullptr, nullptr},
+     {"is_ipu", (getter)THPVariable_is_ipu, nullptr, nullptr, nullptr},
+diff --git a/torch/mlu/amp/__init__.py b/torch/mlu/amp/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/torch/optim/adam.py b/torch/optim/adam.py
+index 50aad78781..00b1bdc68a 100644
+--- a/torch/optim/adam.py
++++ b/torch/optim/adam.py
+@@ -145,7 +145,7 @@ class Adam(Optimizer):
+             # higher prec copy of params to do update math in higher prec to
+             # alleviate the loss of information.
+             if not all(
+-                p.is_cuda and torch.is_floating_point(p)
++                (p.is_cuda or p.is_mlu) and torch.is_floating_point(p)
+                 for pg in self.param_groups for p in pg['params']
+             ):
+                 raise RuntimeError("FusedAdam requires all the params to be CUDA, floating point")
+diff --git a/torch/overrides.py b/torch/overrides.py
+index dbee241ba6..e1675aae28 100644
+--- a/torch/overrides.py
++++ b/torch/overrides.py
+@@ -1185,6 +1185,7 @@ def get_testing_overrides() -> Dict[Callable, Callable]:
+         Tensor.dtype.__get__: lambda self: -1,
+         Tensor.is_cuda.__get__: lambda self: -1,
+         Tensor.is_cpu.__get__: lambda self: -1,
++        Tensor.is_mlu.__get__: lambda self: -1,
+         Tensor.is_xpu.__get__: lambda self: -1,
+         Tensor.is_ipu.__get__: lambda self: -1,
+         Tensor.is_leaf.__get__: lambda self: -1,
+@@ -1240,6 +1241,7 @@ def get_testing_overrides() -> Dict[Callable, Callable]:
+         Tensor.copy_: lambda self, src, non_blocking=False: -1,
+         Tensor.cpu: lambda self, memory_format=torch.preserve_format: -1,
+         Tensor.cuda: lambda self, memory_format=torch.preserve_format: -1,
++        Tensor.mlu: lambda self, memory_format=torch.preserve_format: -1,
+         Tensor.xpu: lambda self, memory_format=torch.preserve_format: -1,
+         Tensor.ipu: lambda self, memory_format=torch.preserve_format: -1,
+         Tensor.data_ptr: lambda self: -1,

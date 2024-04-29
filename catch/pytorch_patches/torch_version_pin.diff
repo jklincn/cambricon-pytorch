@@ -1,0 +1,15 @@
+diff --git a/setup.py b/setup.py
+index 2ef8b7f29d..fd3dbcd38b 100644
+--- a/setup.py
++++ b/setup.py
+@@ -310,6 +310,10 @@ cmake_python_include_dir = sysconfig.get_path("include")
+ ################################################################################
+ # Version, create_version_file, and package_name
+ ################################################################################
++if not os.getenv('PYTORCH_BUILD_VERSION'):
++    os.environ['PYTORCH_BUILD_VERSION'] = "1.13.1"
++    os.environ['PYTORCH_BUILD_NUMBER'] = "1"
++
+ package_name = os.getenv('TORCH_PACKAGE_NAME', 'torch')
+ package_type = os.getenv('PACKAGE_TYPE', 'wheel')
+ version = get_torch_version()

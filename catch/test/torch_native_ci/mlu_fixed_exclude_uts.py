@@ -1,0 +1,20 @@
+MLU_FIXED_EXCLUDE_UTS = [
+    "test_cpp_*",
+    "test_fx*",
+    "test_jit*",
+    "test_mkl*",
+    "test_mobile_optimizer",
+    "test_sparse*",
+    "test_decomp",
+    "test_bundled_*",
+    "test_kernel_launch_checks",
+    "test_nvfuser_frontend",
+    "test_quantization",
+    "test_prims",
+    "test_ops_jit",
+    "test_set_default_mobile_cpu_allocator",
+    "test_vulkan",
+    "test_xnnpack_integration",
+    "test_mps",
+    "test_metal"
+]

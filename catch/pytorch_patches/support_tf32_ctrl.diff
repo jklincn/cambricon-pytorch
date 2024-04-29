@@ -1,0 +1,133 @@
+diff --git a/aten/src/ATen/Context.cpp b/aten/src/ATen/Context.cpp
+index c96b369752..630e831302 100644
+--- a/aten/src/ATen/Context.cpp
++++ b/aten/src/ATen/Context.cpp
+@@ -187,6 +187,15 @@ void Context::setAllowTF32CuBLAS(bool b) {
+   float32_matmul_precision = b ? at::Float32MatmulPrecision::HIGH : at::Float32MatmulPrecision::HIGHEST;
+ }
+
++bool Context::allowTF32CnMatMul() const {
++  static bool allow_tf32_cnmatmul_override = c10::utils::check_env("TORCH_ALLOW_TF32_CNMATMUL_OVERRIDE") == true;
++  return allow_tf32_cnmatmul_override || float32_matmul_precision != at::Float32MatmulPrecision::HIGHEST;
++}
++
++void Context::setAllowTF32CnMatMul(bool b) {
++  setAllowTF32CuBLAS(b);
++}
++
+ Float32MatmulPrecision Context::float32MatmulPrecision() const {
+   return float32_matmul_precision;
+ }
+diff --git a/torch/csrc/profiler/collection.cpp b/torch/csrc/profiler/collection.cpp
+index 6c8e67d710..b6905d08fd 100644
+--- a/torch/csrc/profiler/collection.cpp
++++ b/torch/csrc/profiler/collection.cpp
+@@ -249,6 +249,7 @@ std::unique_ptr<KinetoObserverContext> ThreadLocalSubqueue::begin_op(
+
+   event->start_time_ = torch::profiler::impl::getApproximateTime();
+   event->allow_tf32_cublas_ = at::globalContext().allowTF32CuBLAS();
++  event->allow_tf32_cnmatmul_ = at::globalContext().allowTF32CnMatMul();
+   return out;
+ }
+
+@@ -317,7 +318,8 @@ void ThreadLocalSubqueue::TorchOpStorage::materialize(
+         jit_module(),
+         extra_args(),
+         gpu_fallback(),
+-        event->allow_tf32_cublas_};
++        event->allow_tf32_cublas_,
++        event->allow_tf32_cnmatmul_};
+
+     out.emplace_back(Result::create(
+         time_converter(event->start_time_), tid, kineto_info, std::move(e)));
+diff --git a/torch/csrc/profiler/collection.h b/torch/csrc/profiler/collection.h
+index 0bdf26b397..4ea4c201e5 100644
+--- a/torch/csrc/profiler/collection.h
++++ b/torch/csrc/profiler/collection.h
+@@ -145,7 +145,8 @@ struct ExtraFields<EventType::TorchOp> : TorchOpBasicFields {
+       jit_modules_t&& jit_modules,
+       extra_args_t&& extra_args,
+       FallbackPair&& gpu_fallback,
+-      bool allow_tf32_cublas)
++      bool allow_tf32_cublas,
++      bool allow_tf32_cnmatmul)
+       : TorchOpBasicFields(std::move(f)),
+         correlation_id_{correlation_id},
+         end_time_ns_{end_time_ns},
+@@ -154,7 +155,8 @@ struct ExtraFields<EventType::TorchOp> : TorchOpBasicFields {
+         jit_modules_{std::move(jit_modules)},
+         extra_args_{std::move(extra_args)},
+         gpu_fallback_{std::move(gpu_fallback)},
+-        allow_tf32_cublas_{allow_tf32_cublas} {}
++        allow_tf32_cublas_{allow_tf32_cublas},
++        allow_tf32_cnmatmul_{allow_tf32_cnmatmul} {}
+   uint64_t correlation_id_;
+   time_t end_time_ns_;
+   Inputs inputs_;
+@@ -163,6 +165,7 @@ struct ExtraFields<EventType::TorchOp> : TorchOpBasicFields {
+   extra_args_t extra_args_;
+   FallbackPair gpu_fallback_;
+   bool allow_tf32_cublas_;
++  bool allow_tf32_cnmatmul_;
+ };
+
+ template <>
+@@ -407,6 +410,7 @@ struct KinetoObserverContext : public at::ObserverContext {
+     approx_time_t end_time_{std::numeric_limits<approx_time_t>::min()};
+
+     bool allow_tf32_cublas_;
++    bool allow_tf32_cnmatmul_;
+   };
+
+   explicit KinetoObserverContext(Event* event) : event_{event} {}
+diff --git a/torch/csrc/profiler/python/init.cpp b/torch/csrc/profiler/python/init.cpp
+index 9e1b663d65..c143f28852 100644
+--- a/torch/csrc/profiler/python/init.cpp
++++ b/torch/csrc/profiler/python/init.cpp
+@@ -149,7 +149,8 @@ void initPythonBindings(PyObject* module) {
+       .def_readonly("inputs", &torch_op_t::inputs_)
+       .def_readonly("scope", &torch_op_t::scope_)
+       .def_readonly("sequence_number", &torch_op_t::sequence_number_)
+-      .def_readonly("allow_tf32_cublas", &torch_op_t::allow_tf32_cublas_);
++      .def_readonly("allow_tf32_cublas", &torch_op_t::allow_tf32_cublas_)
++      .def_readonly("allow_tf32_cnmatmul", &torch_op_t::allow_tf32_cnmatmul_);
+
+   py::class_<ExtraFields<EventType::Backend>>(m, "_ExtraFields_Backend");
+
+diff --git a/torch/csrc/Module.cpp b/torch/csrc/Module.cpp
+index b16f03483a..fe967a4a84 100644
+--- a/torch/csrc/Module.cpp
++++ b/torch/csrc/Module.cpp
+@@ -651,6 +651,23 @@ PyObject* THPModule_allowTF32CuBLAS(PyObject* _unused, PyObject* noargs) {
+   Py_RETURN_FALSE;
+ }
+ 
++PyObject* THPModule_setAllowTF32CnMatMul(PyObject* _unused, PyObject* arg) {
++  THPUtils_assert(
++      PyBool_Check(arg),
++      "set_allow_tf32_cnmatmul expects a bool, "
++      "but got %s",
++      THPUtils_typename(arg));
++  at::globalContext().setAllowTF32CnMatMul(arg == Py_True);
++  Py_RETURN_NONE;
++}
++
++PyObject* THPModule_allowTF32CnMatMul(PyObject* _unused, PyObject* noargs) {
++  if (at::globalContext().allowTF32CnMatMul()) {
++    Py_RETURN_TRUE;
++  }
++  Py_RETURN_FALSE;
++}
++
+ PyObject* THPModule_setAllowFP16ReductionCuBLAS(
+     PyObject* _unused,
+     PyObject* arg) {
+@@ -930,6 +947,8 @@ static PyMethodDef TorchMethods[] = {
+     {"_set_warnAlways", THPModule_setWarnAlways, METH_O, nullptr},
+     {"_get_cublas_allow_tf32", THPModule_allowTF32CuBLAS, METH_NOARGS, nullptr},
+     {"_set_cublas_allow_tf32", THPModule_setAllowTF32CuBLAS, METH_O, nullptr},
++    {"_get_cnmatmul_allow_tf32", THPModule_allowTF32CnMatMul, METH_NOARGS, nullptr},
++    {"_set_cnmatmul_allow_tf32", THPModule_setAllowTF32CnMatMul, METH_O, nullptr},
+     {"_get_float32_matmul_precision",
+      THPModule_float32MatmulPrecision,
+      METH_NOARGS,

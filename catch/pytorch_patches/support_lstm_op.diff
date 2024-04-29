@@ -1,0 +1,13 @@
+diff --git a/aten/src/ATen/native/RNN.cpp b/aten/src/ATen/native/RNN.cpp
+index 670395893d..bcc5dcac5f 100644
+--- a/aten/src/ATen/native/RNN.cpp
++++ b/aten/src/ATen/native/RNN.cpp
+@@ -681,7 +681,7 @@ struct LSTMCell : Cell<std::tuple<Tensor, Tensor>, cell_params> {
+     const auto& hx = std::get<0>(hidden);
+     const auto& cx = std::get<1>(hidden);
+ 
+-    if (input.is_cuda()) {
++    if (input.is_cuda() || input.is_mlu()) {
+       TORCH_CHECK(!pre_compute_input);
+       auto igates = params.matmul_ih(input);
+       auto hgates = params.matmul_hh(hx);
