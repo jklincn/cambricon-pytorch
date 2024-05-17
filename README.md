@@ -4,3 +4,77 @@
 
 镜像版本：yellow.hub.cambricon.com/pytorch/pytorch:v1.17.0-torch1.13.1-ubuntu20.04-py310
 
+(python 3.10 + pytorch 1.13.1 + torchvision 0.14.1)
+
+## 前置条件
+
+已成功安装 cambricon-mlu-driver，使用 cnmon 命令可以成功看到 MLU 加速卡
+
+## 安装步骤
+
+使用 Ubuntu-20.04 + bash 作为示例
+
+1. 使用虚拟环境（推荐）
+
+   ```
+   conda create -n myenv python=3.10
+   conda activate myenv
+   ```
+
+2. 下载源代码
+
+   ```
+   git clone --recurse-submodules https://github.com/jklincn/cambricon-pytorch.git
+   cd cambricon-pytorch
+   ```
+
+3. 安装 Pytorch
+
+   ```
+   export PYTORCH_HOME=$(pwd)/pytorch
+   bash catch/scripts/apply_patches_to_pytorch.sh
+   cd pytorch 
+   conda install cmake ninja intel::mkl-static intel::mkl-include
+   pip install -r requirements.txt
+   export CMAKE_PREFIX_PATH=${CONDA_PREFIX:-"$(dirname $(which conda))/../"}
+   export USE_CUDA=0
+   python setup.py install
+   cd ..
+   ```
+
+4. 安装 Cambricon Neuware SDK
+
+   ```
+   ./install_neuware.sh
+   source ~/.bashrc
+   conda activate myenv
+   ```
+
+5. 安装 Catch
+
+   ```
+   cd catch
+   pip install -r requirements.txt
+   python setup.py install
+   cd ..
+   ```
+
+6. 安装 Torchvision
+
+   ```
+   pip install torchvision==0.14.1
+   ```
+
+7. 验证是否安装成功（会有一些 warning，但程序可以正常运行结束）
+
+   ```
+   python catch/examples/training/single_card_demo.py
+   ```
+
+## 测试
+
+```
+python compare.py
+```
+
+compare.py 是寒武纪 MLU 单卡训练和多卡训练对比的示例程序，运行结束后会生成 4 张对比图（损失函数，平滑后的损失函数，训练时间，准确率）
