@@ -14,11 +14,11 @@
 
 使用 Ubuntu-20.04 + bash 作为示例
 
-1. 使用虚拟环境（推荐）
+1. 使用虚拟环境（强烈推荐）
 
    ```
-   conda create -n myenv python=3.10
-   conda activate myenv
+   conda create -n cambricon-pytorch python=3.10
+   conda activate cambricon-pytorch
    ```
 
 2. 下载源代码
@@ -47,7 +47,7 @@
    ```
    ./install_neuware.sh
    source ~/.bashrc
-   conda activate myenv
+   conda activate cambricon-pytorch
    ```
 
 5. 安装 Catch
