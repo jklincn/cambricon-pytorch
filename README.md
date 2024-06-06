@@ -44,6 +44,8 @@
 
 4. 安装 Cambricon Neuware SDK
 
+   注意：脚本仅支持 Ubuntu-18.04/20.04，其他发行版请从[官网](https://sdk.cambricon.com/download?component_name=Neuware+SDK)下载
+
    ```
    ./install_neuware.sh
    source ~/.bashrc
