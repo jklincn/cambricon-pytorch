@@ -30,6 +30,7 @@ def setup(rank, world_size):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "12355"
     dist.init_process_group("cncl", rank=rank, world_size=world_size)
+    torch.mlu.set_device(rank)
 
 
 def evaluate(model, test_loader):
@@ -50,10 +51,9 @@ def evaluate(model, test_loader):
 
 def multi_train(rank, world_size, losses, accuracy_storage):
     setup(rank, world_size)
+    torch.manual_seed(1)
+    torch.mlu.manual_seed(1)
 
-    torch.mlu.set_device(rank)
-
-    # 数据预处理
     transform = transforms.Compose(
         [
             transforms.Resize(256),
@@ -63,9 +63,8 @@ def multi_train(rank, world_size, losses, accuracy_storage):
         ]
     )
 
-    # 加载数据集
     train_set = torchvision.datasets.CIFAR10(
-        root="./data", train=True, download=True, transform=transform
+        root="./data", train=True, transform=transform
     )
     train_sampler = torch.utils.data.distributed.DistributedSampler(
         train_set, num_replicas=world_size, rank=rank
@@ -75,23 +74,20 @@ def multi_train(rank, world_size, losses, accuracy_storage):
     )
 
     test_set = torchvision.datasets.CIFAR10(
-        root="./data", train=False, download=True, transform=transform
+        root="./data", train=False, transform=transform
     )
     test_loader = torch.utils.data.DataLoader(
         test_set, batch_size=batch_size_multi, shuffle=False, num_workers=2
     )
 
-    # 加载预训练的 mobilenet_v2 模型并修改最后的分类层
     model = models.mobilenet_v2(weights="MobileNet_V2_Weights.DEFAULT")
     model.classifier[1] = nn.Linear(model.last_channel, 10)
     model = model.to(device)
     model = DDP(model, device_ids=[rank])
 
-    # 定义损失函数和优化器
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(model.parameters(), lr=lr_multi, momentum=0.9)
 
-    # 训练模型
     for epoch in range(num_epochs):
         model.train()
         train_sampler.set_epoch(epoch)
@@ -105,12 +101,12 @@ def multi_train(rank, world_size, losses, accuracy_storage):
             if rank == 0:
                 losses.append(loss.item())
             if i % 100 == 0:
-                if rank == 0:  # 仅在主进程中打印
+                if rank == 0:
                     print(
                         f"Rank {rank}, Epoch {epoch+1}/{num_epochs}, Iteration {i}, Loss: {loss.item():.4f}"
                     )
 
-    if rank == 0:  # 仅在 rank 0 上进行评估并存储准确率
+    if rank == 0:
         accuracy = evaluate(model, test_loader)
         accuracy_storage.append(accuracy)
 
@@ -118,6 +114,8 @@ def multi_train(rank, world_size, losses, accuracy_storage):
 
 
 def single_card():
+    torch.manual_seed(1)
+    torch.mlu.manual_seed(1)
     transform = transforms.Compose(
         [
             transforms.Resize(256),
@@ -172,8 +170,8 @@ def multi_card():
     world_size = torch.mlu.device_count()
     start_time = time.time()
     with mp.Manager() as manager:
-        multi_losses = manager.list()  # 创建一个共享的损失列表
-        accuracy_storage = manager.list()  # 创建一个共享的准确率列表
+        multi_losses = manager.list()
+        accuracy_storage = manager.list()
         mp.spawn(
             multi_train,
             args=(world_size, multi_losses, accuracy_storage),

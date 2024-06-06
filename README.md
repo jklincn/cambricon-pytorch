@@ -8,7 +8,7 @@
 
 ## 前置条件
 
-已成功安装 cambricon-mlu-driver，使用 cnmon 命令可以成功看到 MLU 加速卡
+已成功安装 [cambricon-mlu-driver](https://sdk.cambricon.com/download?component_name=Driver)，使用 cnmon 命令可以成功看到 MLU 加速卡
 
 ## 安装步骤
 
@@ -74,6 +74,7 @@
 ## 测试
 
 ```
+pip install matplotlib
 python compare.py
 ```
 
