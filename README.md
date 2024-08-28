@@ -8,7 +8,8 @@
 
 ## 前置条件
 
-已成功安装 [cambricon-mlu-driver](https://sdk.cambricon.com/download?component_name=Driver)，使用 cnmon 命令可以成功看到 MLU 加速卡
+1. 已成功安装 [cambricon-mlu-driver](https://sdk.cambricon.com/download?component_name=Driver)，使用 cnmon 命令可以成功看到 MLU 加速卡
+2. 已安装 [Anaconda](https://www.anaconda.com/) 或者 [Miniconda](https://docs.anaconda.com/miniconda/)
 
 ## 安装步骤
 
